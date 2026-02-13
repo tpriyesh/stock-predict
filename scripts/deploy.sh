@@ -21,7 +21,9 @@
 #   - Old container keeps running until new image is built
 #   - Rolls back if health check fails
 # ============================================================
-set -euo pipefail
+set -e
+set -u
+set -o pipefail
 
 # --- Config ---
 VPS_HOST="vps"                          # SSH alias from ~/.ssh/config
