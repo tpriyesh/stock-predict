@@ -9,6 +9,7 @@ Reference document for the Hostinger VPS deployment. Covers what was done, why, 
 - [Security Hardening](#security-hardening)
 - [Docker Deployment](#docker-deployment)
 - [Git-Based Workflow](#git-based-workflow)
+- [Deploy Script](#deploy-script)
 - [Challenges & Solutions](#challenges--solutions)
 - [Daily Operations](#daily-operations)
 - [Troubleshooting](#troubleshooting)
@@ -258,6 +259,158 @@ ssh vps-root     # Root access on port 22 (disabled after hardening)
 ### .gitignore Design
 
 The `.gitignore` uses `/data/` (with leading slash) instead of `data/` to only exclude the top-level data directory. Without the slash, `src/data/` (source code) was also excluded — this was a bug we caught and fixed.
+
+---
+
+## Deploy Script
+
+### Usage
+
+```bash
+bash scripts/deploy.sh              # Full deploy (recommended)
+bash scripts/deploy.sh --skip-tests # Skip local tests (when you've already run them)
+bash scripts/deploy.sh --force      # Deploy during market hours (emergency fixes only)
+```
+
+### What It Does
+
+One command handles the entire deployment pipeline with built-in safety:
+
+```
+bash scripts/deploy.sh
+         │
+         ▼
+┌─ STEP 0: Safety Checks (on your Mac) ─────────────────────┐
+│                                                             │
+│  ① Are we in the right folder? (checks start.py exists)    │
+│  ② Any uncommitted changes? → Asks you to commit first     │
+│  ③ Is market open (9:15-3:30 IST, Mon-Fri)?                │
+│     YES → BLOCKS deploy (use --force to override)           │
+│     NO  → Continues                                         │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 1: Run Tests (on your Mac) ─────────────────────────┐
+│                                                             │
+│  Runs: python -m pytest tests/ -q                          │
+│  FAIL → Stops. Nothing reaches the server.                 │
+│  PASS → Continues                                          │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 2: Push to GitHub ──────────────────────────────────┐
+│                                                             │
+│  Runs: git push origin main                                │
+│  Your Mac ──→ GitHub                                        │
+│  (audit trail — every deploy is a commit)                   │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 3: Pull on VPS ────────────────────────────────────┐
+│                                                             │
+│  SSHs into VPS, runs: git pull origin main                 │
+│  GitHub ──→ VPS                                             │
+│  Verifies commit hash matches local (no drift)             │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 4: Build Docker on VPS ─────────────────────────────┐
+│                                                             │
+│  Runs: docker compose build (on VPS)                       │
+│  OLD container keeps running during build                   │
+│  Uses cached layers — only rebuilds what changed           │
+│  (usually takes 5-10 seconds for code-only changes)        │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 5: Restart Container ──────────────────────────────┐
+│                                                             │
+│  Runs: docker compose up -d                                │
+│  Stops old container → Starts new one                      │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─ STEP 6: Health Check ───────────────────────────────────┐
+│                                                             │
+│  Waits 5 seconds, then checks:                             │
+│  - Is container running?                                    │
+│  - Shows last 10 log lines                                 │
+│  - Prints deploy summary with commit hash and time         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Safety Features
+
+| Feature | What It Does | Why |
+|---------|-------------|-----|
+| **Uncommitted change check** | Blocks deploy if working tree is dirty | Forces every change to be a git commit — fully traceable |
+| **Market hours block** | Blocks deploy Mon-Fri 9:15-3:30 IST | Restarting the container would kill active trades and orphan positions |
+| **Local test gate** | Runs 449 tests before pushing | Broken code never reaches the server |
+| **Commit hash verification** | Compares local and VPS commit after pull | Catches git conflicts, partial pulls, or repo drift |
+| **Build before restart** | Old container runs while new image builds | No downtime during build — old version keeps trading |
+| **Health check** | Verifies container status after restart | Confirms deploy succeeded, shows recent logs |
+
+### Why Build on VPS (Not Local)?
+
+**Option A: Build locally, push image to Docker Hub, pull on VPS**
+- Requires a Docker registry account (Docker Hub, GitHub Container Registry)
+- Upload 1GB+ image over internet on every deploy
+- More infrastructure to maintain (registry credentials, cleanup old images)
+- Overkill for a single developer
+
+**Option B: Build on VPS after git pull** (what we do)
+- VPS has 16GB RAM, 4 vCPU — builds fast
+- Only pulls code changes (KB), not images (GB)
+- Docker layer caching means rebuilds take 5-10 seconds for code changes
+- Simple: git pull → build → restart
+- No external dependencies beyond GitHub
+
+**Option C: CI/CD (GitHub Actions)**
+- Industry standard for teams
+- Overkill for a single developer
+- Can be added later by adding `.github/workflows/deploy.yml`
+
+We chose **Option B** — simplest, no extra infrastructure, fast enough for one developer.
+
+### Example Output
+
+```
+============================================================
+  Stock-Predict Deploy
+============================================================
+
+[+] Running local tests...
+449 passed in 10.33s
+[+] All tests passed
+[+] Pushing to GitHub...
+[+] Pushed commit: d22be36
+[+] Pulling on VPS...
+  Updating 01cc802..d22be36
+  Fast-forward
+[+] VPS at commit: d22be36 (matches local)
+[+] Building Docker image on VPS...
+  Image stock-predict-trading-agent Built
+[+] Docker image built
+[+] Restarting container...
+  Container stock-predict Recreated
+  Container stock-predict Started
+[+] Container restarted
+[+] Running health check (waiting 5s)...
+[+] Container status: restarting (restarts: 0)
+
+[+] Recent logs:
+  STOCK-PREDICT TRADING AGENT
+  Date:    Friday, February 13, 2026
+  Market is already closed for today.
+
+============================================================
+  Deploy complete
+============================================================
+  Commit:    d22be36
+  Time:      2026-02-13 19:58 IST
+  Container: restarting
+============================================================
+```
 
 ---
 
