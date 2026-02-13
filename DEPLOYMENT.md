@@ -471,48 +471,191 @@ We chose **Option B** — simplest, no extra infrastructure, fast enough for one
 
 ---
 
-## Daily Operations
+## Command Reference
 
-### Start Paper Trading
-```bash
-ssh vps "cd /opt/stock-predict && docker compose up -d"
+All commands below run from your Mac terminal. The `ssh vps` alias connects to `deploy@72.62.230.66:2222` automatically.
+
+### SSH / Connect to VPS
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps` | Connect to VPS as deploy user (daily use) |
+| `exit` | Disconnect from VPS (once connected) |
+
+### Deploy (Push Code Changes to VPS)
+
+| Command | What It Does |
+|---------|-------------|
+| `bash scripts/deploy.sh` | **Full deploy** — tests → push → pull → build → restart → health check |
+| `bash scripts/deploy.sh --skip-tests` | Deploy without running tests locally (when you've already run them) |
+| `bash scripts/deploy.sh --force` | Deploy during market hours (emergency fixes only) |
+
+### Docker — Container Management
+
+Run these from your Mac (they SSH into VPS automatically):
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "docker ps"` | Show running containers (name, status, uptime) |
+| `ssh vps "docker ps -a"` | Show ALL containers including stopped ones |
+| `ssh vps "docker images"` | List all Docker images on VPS (name, size) |
+| `ssh vps "docker stats --no-stream"` | Show CPU, memory, network usage of running containers |
+
+### Docker — Start / Stop / Restart
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "cd /opt/stock-predict && docker compose up -d"` | **Start** paper trading (runs in background) |
+| `ssh vps "cd /opt/stock-predict && docker compose -f docker-compose.yml -f docker-compose.live.yml up -d"` | **Start** live trading (real money, Zerodha) |
+| `ssh vps "cd /opt/stock-predict && docker compose stop"` | **Stop** container (can restart later, keeps data) |
+| `ssh vps "cd /opt/stock-predict && docker compose down"` | **Stop + remove** container (clean slate) |
+| `ssh vps "cd /opt/stock-predict && docker compose restart"` | **Restart** container (quick restart, no rebuild) |
+| `ssh vps "cd /opt/stock-predict && docker compose up -d --force-recreate"` | **Force recreate** container (fresh start with same image) |
+
+**Difference between `stop`, `down`, and `restart`:**
+- `stop` — Pauses the container. Data and state preserved. `up -d` to resume.
+- `down` — Stops AND removes the container. Volumes (data/logs) are kept. `up -d` creates a new one.
+- `restart` — Quick stop + start. No rebuild. Use for "have you tried turning it off and on again."
+
+### Docker — Logs
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "docker logs stock-predict"` | Show ALL logs from container (can be very long) |
+| `ssh vps "docker logs --tail 50 stock-predict"` | Show last 50 lines of logs |
+| `ssh vps "docker logs -f stock-predict"` | **Follow** logs live (like `tail -f`). Press Ctrl+C to stop. |
+| `ssh vps "docker logs --since 1h stock-predict"` | Show logs from last 1 hour |
+| `ssh vps "docker logs --since 2026-02-13T09:15:00 stock-predict"` | Show logs from specific time |
+
+### Docker — Build
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "cd /opt/stock-predict && docker compose build"` | Build image (uses cached layers — fast for code-only changes) |
+| `ssh vps "cd /opt/stock-predict && docker compose build --no-cache"` | **Full rebuild** from scratch (use when dependencies change) |
+
+### Docker — Debug / Troubleshoot
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "docker inspect stock-predict"` | Show full container config (env vars, volumes, network) |
+| `ssh vps "docker inspect --format='{{.State.Status}}' stock-predict"` | Show container status (running/restarting/exited) |
+| `ssh vps "docker inspect --format='{{.RestartCount}}' stock-predict"` | Show how many times container has restarted |
+| `ssh vps "cd /opt/stock-predict && docker compose run --rm --entrypoint bash trading-agent"` | **Open a shell** inside a fresh container (for debugging) |
+| `ssh vps "cd /opt/stock-predict && docker compose run --rm --entrypoint python trading-agent -c \"import os; print(os.getenv('OPENAI_API_KEY', 'MISSING'))\"` " | Test if env vars reach the container |
+| `ssh vps "cd /opt/stock-predict && docker compose run --rm --entrypoint 'python -m pytest' trading-agent tests/ -v"` | Run tests inside Docker on VPS |
+
+### Docker — Cleanup
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "docker system df"` | Show disk usage by Docker (images, containers, volumes) |
+| `ssh vps "docker image prune -f"` | Remove old/unused images (frees disk space) |
+| `ssh vps "docker system prune -f"` | Remove all unused images, containers, networks (keeps volumes) |
+| `ssh vps "docker volume ls"` | List all volumes (trading_data, trading_logs) |
+
+**Never run** `docker system prune -a --volumes` — this deletes your trade data.
+
+### Git — Version Control
+
+Run from your Mac in the stock-predict directory:
+
+| Command | What It Does |
+|---------|-------------|
+| `git status` | Show what files changed (uncommitted work) |
+| `git diff` | Show actual line-by-line changes |
+| `git add -A && git commit -m "message"` | Stage and commit all changes |
+| `git push origin main` | Push to GitHub |
+| `git log --oneline -10` | Show last 10 commits (one line each) |
+| `git log --oneline --graph` | Show commit history as a tree |
+
+### Git — On VPS
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "cd /opt/stock-predict && git log --oneline -5"` | Show last 5 commits on VPS |
+| `ssh vps "cd /opt/stock-predict && git pull origin main"` | Pull latest code from GitHub to VPS |
+| `ssh vps "cd /opt/stock-predict && git status"` | Check if VPS has any drift from repo |
+
+### Trading — Monitor
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "docker logs -f stock-predict"` | Watch trading in real-time |
+| `ssh vps "docker logs --since 09:15 stock-predict 2>&1 \| grep -i 'entry\|exit\|signal\|error'"` | Show only trade entries, exits, signals, and errors |
+| `ssh vps "docker logs stock-predict 2>&1 \| grep -i 'pnl\|profit\|loss'"` | Show P&L related logs |
+
+### Trading — Database
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "sqlite3 /opt/stock-predict/data/trades.db '.tables'"` | List all tables in trade database |
+| `ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT * FROM trades ORDER BY entry_time DESC LIMIT 10;'"` | Show last 10 trades |
+| `ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT symbol, entry_price, exit_price, pnl, status FROM trades WHERE date(entry_time) = date(\"now\");'"` | Show today's trades |
+| `ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT SUM(pnl) as total_pnl FROM trades WHERE date(entry_time) = date(\"now\");'"` | Show today's total P&L |
+| `ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT date(entry_time) as day, COUNT(*) as trades, SUM(pnl) as pnl FROM trades GROUP BY day ORDER BY day DESC LIMIT 7;'"` | Show last 7 days summary |
+
+### VPS — System Health
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "free -h"` | Show RAM usage |
+| `ssh vps "df -h /"` | Show disk usage |
+| `ssh vps "uptime"` | Show how long VPS has been running |
+| `ssh vps "top -bn1 \| head -15"` | Show top CPU/memory processes |
+| `ssh vps "docker stats --no-stream"` | Show Docker container resource usage |
+
+### VPS — Security
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "sudo ufw status"` | Show firewall rules |
+| `ssh vps "sudo fail2ban-client status sshd"` | Show banned IPs and fail count |
+| `ssh vps "sudo fail2ban-client set sshd unbanip YOUR_IP"` | Unban your IP if accidentally locked out |
+| `ssh vps "sudo journalctl -u ssh --since '1 hour ago'"` | Show SSH login attempts (last hour) |
+| `ssh vps "last -10"` | Show last 10 logins to VPS |
+| `ssh vps "ls -la /opt/stock-predict/.env"` | Verify .env permissions (should be 600) |
+
+### VPS — Service Management
+
+| Command | What It Does |
+|---------|-------------|
+| `ssh vps "sudo systemctl status docker"` | Check Docker daemon status |
+| `ssh vps "sudo systemctl restart docker"` | Restart Docker daemon (restarts all containers) |
+| `ssh vps "sudo systemctl restart ssh"` | Restart SSH server |
+| `ssh vps "sudo reboot"` | Reboot VPS (Docker containers auto-start after) |
+
+### Local — Testing
+
+Run from your Mac in the stock-predict directory:
+
+| Command | What It Does |
+|---------|-------------|
+| `python -m pytest tests/ -v` | Run all 449 tests with verbose output |
+| `python -m pytest tests/ -q` | Run all tests, quiet output (pass/fail only) |
+| `python -m pytest tests/test_orchestrator.py -v` | Run only orchestrator tests |
+| `python -m pytest tests/ -k "test_kill_switch"` | Run tests matching a keyword |
+| `python trade.py start` | Start paper trading locally (on your Mac) |
+| `python trade.py pnl` | Show P&L and trade history |
+| `python trade.py status` | Show broker connection status |
+
+### Quick Reference Card
+
 ```
+# === DAILY USE ===
+bash scripts/deploy.sh                    # Deploy changes to VPS
+ssh vps "docker logs -f stock-predict"    # Watch live trading
+ssh vps "docker ps"                       # Is it running?
 
-### Start Live Trading (Zerodha)
-```bash
-ssh vps "cd /opt/stock-predict && docker compose -f docker-compose.yml -f docker-compose.live.yml up -d"
-```
+# === TRADING CONTROL ===
+ssh vps "cd /opt/stock-predict && docker compose up -d"      # Start (paper)
+ssh vps "cd /opt/stock-predict && docker compose stop"       # Stop
+ssh vps "cd /opt/stock-predict && docker compose restart"    # Restart
 
-### Check Status
-```bash
-ssh vps "docker ps"                          # Container status
-ssh vps "docker logs -f stock-predict"       # Follow live logs
-ssh vps "docker logs --tail 50 stock-predict" # Last 50 lines
-```
-
-### Deploy New Code
-```bash
-# On your Mac:
-git add -A && git commit -m "description" && git push
-
-# Then deploy:
-ssh vps "cd /opt/stock-predict && git pull && docker compose build && docker compose up -d"
-```
-
-### Stop Trading
-```bash
-ssh vps "cd /opt/stock-predict && docker compose down"
-```
-
-### Emergency: Check VPS Health
-```bash
-ssh vps "free -h && df -h / && docker ps && ufw status"
-```
-
-### View Trade Database
-```bash
-ssh vps "sqlite3 /opt/stock-predict/data/trades.db '.tables'"
-ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT * FROM trades ORDER BY entry_time DESC LIMIT 10;'"
+# === EMERGENCY ===
+ssh vps "cd /opt/stock-predict && docker compose down"       # Kill everything
+ssh vps "docker logs --tail 100 stock-predict"               # What went wrong?
+ssh vps "free -h && df -h / && docker ps"                    # VPS healthy?
 ```
 
 ---
@@ -521,28 +664,51 @@ ssh vps "sqlite3 /opt/stock-predict/data/trades.db 'SELECT * FROM trades ORDER B
 
 ### Can't SSH In
 1. Check if VPS is running in Hostinger hPanel
-2. Use Hostinger web terminal (serial console — always works)
+2. Use Hostinger web terminal (serial console — always works, bypasses network)
 3. Verify: `ufw status` shows port 2222 open
 4. Verify: `ss -tlnp | grep ssh` shows sshd on 2222
 5. Check fail2ban: `fail2ban-client status sshd` (your IP might be banned)
 6. Unban yourself: `fail2ban-client set sshd unbanip YOUR_IP`
+7. If all else fails: Hostinger hPanel → Reboot VPS
 
 ### Docker Build Fails
 1. Check DNS: `docker run --rm alpine nslookup google.com`
-2. If DNS fails, verify `/etc/docker/daemon.json` has explicit DNS
+2. If DNS fails, verify `/etc/docker/daemon.json` has `"dns": ["8.8.8.8", "1.1.1.1"]`
 3. Restart Docker: `sudo systemctl restart docker`
-4. Check disk space: `df -h /`
+4. Check disk space: `df -h /` (if >90% full, run `docker system prune -f`)
+5. Full rebuild: `docker compose build --no-cache`
 
 ### Container Won't Start
 1. Check logs: `docker logs stock-predict`
 2. Check .env exists: `ls -la /opt/stock-predict/.env`
-3. Test env vars: `docker compose run --rm --entrypoint python trading-agent -c "import os; print(os.getenv('OPENAI_API_KEY', 'MISSING'))"`
+3. Test env vars reach container: `docker compose run --rm --entrypoint python trading-agent -c "import os; print(os.getenv('OPENAI_API_KEY', 'MISSING'))"`
+4. Check image exists: `docker images | grep stock-predict`
+5. Rebuild: `docker compose build --no-cache && docker compose up -d`
 
 ### Market Hours but No Trading
-1. Check container is running: `docker ps`
+1. Check container is running: `docker ps` (should show "Up", not "Restarting")
 2. Check it's not weekend/holiday
 3. Check logs for errors: `docker logs --tail 100 stock-predict`
 4. Verify broker credentials in .env
+5. Check API quotas: look for "quota exhausted" or "rate limit" in logs
+
+### Container Keeps Restarting
+1. Check exit code: `docker inspect --format='{{.State.ExitCode}}' stock-predict`
+   - Exit 0 = clean exit (market closed — this is normal)
+   - Exit 1 = error (check logs)
+   - Exit 137 = killed by OOM or Docker (check `free -h`)
+2. Check logs: `docker logs --tail 20 stock-predict`
+
+### VPS Running Slow
+1. Check memory: `free -h` (if swap is being used, you're low on RAM)
+2. Check CPU: `top -bn1 | head -10`
+3. Check disk: `df -h /` (if >90%, clean up Docker: `docker system prune -f`)
+4. Check if other processes are eating resources: `ps aux --sort=-%mem | head -10`
+
+### Lost SSH Key / New Mac
+1. Use Hostinger web terminal to access VPS
+2. Add your new public key: `echo "your-new-key" >> /home/deploy/.ssh/authorized_keys`
+3. Update `~/.ssh/config` on your new Mac with the VPS alias
 
 ---
 
