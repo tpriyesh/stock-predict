@@ -29,9 +29,8 @@ wheels/
 .installed.cfg
 *.egg
 
-# Data (runtime — not source code)
-data/
-!data/.gitkeep
+# Data (runtime — not source code, top-level only)
+/data/
 
 # Database
 *.db
