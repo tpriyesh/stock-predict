@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/priyeshtiwari/codebase/stock-predict/scripts/run_daemon.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/priyeshtiwari/codebase/stock-predict</string>
+
+    <!-- Start automatically on login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the process exits with non-zero (crash) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/priyeshtiwari/codebase/stock-predict/logs/daemon_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/priyeshtiwari/codebase/stock-predict/logs/daemon_stderr.log</string>
+
+    <!-- Restart after 60 seconds if it crashes (prevent tight loop) -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Lower priority to not hog CPU -->
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- Low priority I/O -->
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

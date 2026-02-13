@@ -1,0 +1,41 @@
+services:
+  trading-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-predict
+    volumes:
+      - trading_data:/app/data
+      - trading_logs:/app/logs
+    environment:
+      - TZ=Asia/Kolkata
+    env_file:
+      - .env
+    # Default: paper mode. Override with docker-compose.live.yml
+    restart: unless-stopped
+
+    # === SECURITY HARDENING ===
+    # No ports exposed (daemon only, no web UI)
+    # Read-only filesystem (writable paths via volumes/tmpfs)
+    read_only: true
+    tmpfs:
+      - /tmp:size=50M
+      - /app/__pycache__:size=20M
+    # Drop ALL Linux capabilities (no privileged ops needed)
+    cap_drop:
+      - ALL
+    # Prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  trading_data:
+    driver: local
+  trading_logs:
+    driver: local

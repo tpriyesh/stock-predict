@@ -1,0 +1,52 @@
+[Unit]
+Description=Stock-Predict Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/stock-predict
+ExecStart=/opt/stock-predict/.venv/bin/python start.py
+Restart=on-failure
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/opt/stock-predict/.env
+
+# === SECURITY HARDENING ===
+# Prevent privilege escalation
+NoNewPrivileges=yes
+
+# Filesystem isolation
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/stock-predict/data /opt/stock-predict/logs
+
+# Kernel protection
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+
+# Network: only allow IPv4/IPv6 (no raw sockets, netlink, etc.)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Misc hardening
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+# Docker image deps — lean set for trading daemon (no UI/notebooks)
+# Core
+pandas>=2.0
+numpy>=1.24
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# Data fetching
+yfinance>=0.2.30
+requests>=2.31
+feedparser>=6.0
+aiohttp>=3.9
+
+# ML (pin xgboost<3.0 to avoid 290MB nvidia-nccl-cu12 CUDA dependency)
+scikit-learn>=1.3
+xgboost>=2.0,<3.0
+lightgbm>=4.0
+
+# Technical Analysis
+ta>=0.11
+
+# LLM
+openai>=1.0
+
+# Storage
+duckdb>=0.9
+
+# Broker SDKs
+kiteconnect>=5.0
+pyotp>=2.9
+
+# Utils
+python-dotenv>=1.0
+loguru>=0.7
+tenacity>=8.2
+pytz>=2023.3

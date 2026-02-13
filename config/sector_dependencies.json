@@ -1,0 +1,305 @@
+{
+  "version": "1.0",
+  "description": "Sector dependency mapping for external factors impact on Indian stocks",
+  "last_updated": "2026-01-04",
+
+  "macro_symbols": {
+    "commodities": {
+      "crude_brent": {"symbol": "BZ=F", "name": "Brent Crude Oil", "unit": "USD/barrel"},
+      "crude_wti": {"symbol": "CL=F", "name": "WTI Crude Oil", "unit": "USD/barrel"},
+      "gold": {"symbol": "GC=F", "name": "Gold Futures", "unit": "USD/oz"},
+      "silver": {"symbol": "SI=F", "name": "Silver Futures", "unit": "USD/oz"},
+      "copper": {"symbol": "HG=F", "name": "Copper Futures", "unit": "USD/lb"},
+      "natural_gas": {"symbol": "NG=F", "name": "Natural Gas", "unit": "USD/MMBtu"},
+      "steel_proxy": {"symbol": "PKX", "name": "POSCO (Steel proxy)", "unit": "USD"}
+    },
+    "currencies": {
+      "usdinr": {"symbol": "USDINR=X", "name": "USD/INR Exchange Rate", "unit": "INR"},
+      "dxy": {"symbol": "DX-Y.NYB", "name": "US Dollar Index", "unit": "Index"},
+      "eurusd": {"symbol": "EURUSD=X", "name": "EUR/USD", "unit": "USD"},
+      "gbpusd": {"symbol": "GBPUSD=X", "name": "GBP/USD", "unit": "USD"},
+      "usdjpy": {"symbol": "USDJPY=X", "name": "USD/JPY", "unit": "JPY"}
+    },
+    "bonds": {
+      "us_10y": {"symbol": "^TNX", "name": "US 10Y Treasury Yield", "unit": "%"},
+      "us_2y": {"symbol": "^IRX", "name": "US 2Y Treasury Yield", "unit": "%"},
+      "us_30y": {"symbol": "^TYX", "name": "US 30Y Treasury Yield", "unit": "%"}
+    },
+    "indices": {
+      "sox": {"symbol": "^SOX", "name": "PHLX Semiconductor Index", "unit": "Index"},
+      "vix": {"symbol": "^VIX", "name": "CBOE Volatility Index", "unit": "Index"},
+      "sp500": {"symbol": "^GSPC", "name": "S&P 500", "unit": "Index"},
+      "nasdaq": {"symbol": "^IXIC", "name": "NASDAQ Composite", "unit": "Index"}
+    }
+  },
+
+  "geopolitical_events": {
+    "russia_ukraine": {
+      "keywords": ["Russia", "Ukraine", "Putin", "Kyiv", "NATO", "sanctions Russia"],
+      "regions": ["Europe", "Russia"],
+      "primary_impact": ["Oil_Gas", "Metals", "FMCG"],
+      "risk_level": "high"
+    },
+    "middle_east": {
+      "keywords": ["Israel", "Iran", "Gaza", "Hamas", "Hezbollah", "Saudi Arabia", "OPEC", "Red Sea", "Houthi"],
+      "regions": ["Middle East"],
+      "primary_impact": ["Oil_Gas", "Chemicals", "Power"],
+      "risk_level": "high"
+    },
+    "us_china_trade": {
+      "keywords": ["US-China", "trade war", "tariff", "chip ban", "Huawei", "Taiwan", "TSMC", "semiconductor ban"],
+      "regions": ["Asia", "North America"],
+      "primary_impact": ["IT", "Pharma", "Chemicals", "Auto"],
+      "risk_level": "medium"
+    },
+    "india_domestic": {
+      "keywords": ["RBI", "repo rate", "inflation India", "Lok Sabha", "BJP", "Congress", "budget India", "GST", "FDI India"],
+      "regions": ["India"],
+      "primary_impact": ["Banking", "Finance", "FMCG", "Auto", "Infra"],
+      "risk_level": "medium"
+    },
+    "global_recession": {
+      "keywords": ["recession", "Fed rate", "inflation", "unemployment", "GDP growth"],
+      "regions": ["Global"],
+      "primary_impact": ["IT", "Banking", "Metals", "Auto"],
+      "risk_level": "high"
+    }
+  },
+
+  "sector_dependencies": {
+    "IT": {
+      "description": "Export-driven IT services, highly sensitive to USD/INR and US tech markets",
+      "macro": {
+        "usdinr": {"direction": "positive", "weight": 0.35, "lag_days": 1, "reason": "IT exports priced in USD, weaker INR = higher INR revenue"},
+        "dxy": {"direction": "positive", "weight": 0.10, "lag_days": 0, "reason": "Strong dollar generally bullish for exporters"},
+        "us_10y": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "Higher yields = lower growth stock valuations"},
+        "nasdaq": {"direction": "positive", "weight": 0.20, "lag_days": 0, "reason": "US tech sentiment drives IT outsourcing demand"},
+        "sox": {"direction": "positive", "weight": 0.10, "lag_days": 0, "reason": "Semiconductor health indicates tech capex"}
+      },
+      "geopolitical": {
+        "us_china_trade": {"direction": "positive", "weight": 0.25, "reason": "India benefits as alternative to China"},
+        "global_recession": {"direction": "negative", "weight": 0.30, "reason": "US/EU clients cut IT spending in recession"}
+      },
+      "social_weight": 0.15
+    },
+
+    "Banking": {
+      "description": "Interest rate sensitive, domestic economy proxy",
+      "macro": {
+        "us_10y": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "Global rates influence domestic rates"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "INR depreciation increases import costs, inflation"},
+        "gold": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Gold as safe haven competes with bank deposits"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "variable", "weight": 0.40, "reason": "RBI policy directly impacts banks"},
+        "global_recession": {"direction": "negative", "weight": 0.25, "reason": "Credit demand falls, NPAs rise"}
+      },
+      "social_weight": 0.20
+    },
+
+    "Finance": {
+      "description": "NBFCs, insurance, asset management - rate and credit cycle sensitive",
+      "macro": {
+        "us_10y": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "Higher rates increase cost of funds"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Currency volatility affects portfolio values"},
+        "sp500": {"direction": "positive", "weight": 0.10, "lag_days": 0, "reason": "Global risk appetite affects asset managers"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "variable", "weight": 0.35, "reason": "RBI and SEBI policies crucial"},
+        "global_recession": {"direction": "negative", "weight": 0.20, "reason": "AUM declines, credit quality suffers"}
+      },
+      "social_weight": 0.15
+    },
+
+    "Oil_Gas": {
+      "description": "Highly commodity-driven, geopolitical sensitive",
+      "macro": {
+        "crude_brent": {"direction": "positive", "weight": 0.40, "lag_days": 0, "reason": "Oil prices directly impact OMC margins and upstream profits"},
+        "crude_wti": {"direction": "positive", "weight": 0.15, "lag_days": 0, "reason": "Secondary oil benchmark"},
+        "natural_gas": {"direction": "positive", "weight": 0.15, "lag_days": 0, "reason": "Gas prices affect GAIL, Petronet"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "INR weakness increases import bill for oil marketing companies"}
+      },
+      "geopolitical": {
+        "middle_east": {"direction": "positive", "weight": 0.35, "reason": "ME conflict = oil supply disruption fears = price spike"},
+        "russia_ukraine": {"direction": "positive", "weight": 0.25, "reason": "Russia sanctions affect global oil supply"}
+      },
+      "social_weight": 0.05
+    },
+
+    "Pharma": {
+      "description": "Export-oriented, USD-sensitive, regulatory dependent",
+      "macro": {
+        "usdinr": {"direction": "positive", "weight": 0.30, "lag_days": 1, "reason": "60%+ revenue from US exports, weaker INR = higher INR realization"},
+        "dxy": {"direction": "positive", "weight": 0.10, "lag_days": 0, "reason": "Strong dollar bullish for exporters"}
+      },
+      "geopolitical": {
+        "us_china_trade": {"direction": "positive", "weight": 0.25, "reason": "India pharma gains from China supply chain shift"},
+        "india_domestic": {"direction": "variable", "weight": 0.15, "reason": "Drug pricing policies affect domestic margins"}
+      },
+      "social_weight": 0.15
+    },
+
+    "Metals": {
+      "description": "Highly commodity-driven, China demand sensitive",
+      "macro": {
+        "copper": {"direction": "positive", "weight": 0.25, "lag_days": 0, "reason": "Copper prices direct input to metal companies"},
+        "steel_proxy": {"direction": "positive", "weight": 0.25, "lag_days": 0, "reason": "Steel prices affect Tata Steel, JSW"},
+        "gold": {"direction": "positive", "weight": 0.15, "lag_days": 0, "reason": "Gold prices affect gold mining/refining companies"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "INR weakness increases import costs"}
+      },
+      "geopolitical": {
+        "us_china_trade": {"direction": "variable", "weight": 0.20, "reason": "China stimulus = metal demand, trade war = demand uncertainty"},
+        "russia_ukraine": {"direction": "positive", "weight": 0.15, "reason": "Russia/Ukraine are major metal exporters, disruption = price spike"}
+      },
+      "social_weight": 0.10
+    },
+
+    "Auto": {
+      "description": "Input cost sensitive, domestic demand driven",
+      "macro": {
+        "steel_proxy": {"direction": "negative", "weight": 0.20, "lag_days": 0, "reason": "Steel is major input cost for auto"},
+        "copper": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Copper used in wiring, EVs"},
+        "crude_brent": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "High fuel prices reduce car demand"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Import components become expensive"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "positive", "weight": 0.25, "reason": "Govt policies on EVs, scrappage, GST affect auto"},
+        "global_recession": {"direction": "negative", "weight": 0.15, "reason": "Discretionary spending on autos declines"}
+      },
+      "social_weight": 0.15
+    },
+
+    "FMCG": {
+      "description": "Defensive, input cost sensitive, rural demand driven",
+      "macro": {
+        "crude_brent": {"direction": "negative", "weight": 0.20, "lag_days": 0, "reason": "Packaging, logistics costs rise with oil"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Import costs for ingredients"},
+        "gold": {"direction": "negative", "weight": 0.05, "lag_days": 0, "reason": "Rural gold spending competes with FMCG"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "positive", "weight": 0.30, "reason": "Rural schemes, monsoon, minimum support prices crucial"},
+        "russia_ukraine": {"direction": "negative", "weight": 0.10, "reason": "Wheat/sunflower oil supply disruption"}
+      },
+      "social_weight": 0.10
+    },
+
+    "Infra": {
+      "description": "Government capex driven, interest rate sensitive",
+      "macro": {
+        "steel_proxy": {"direction": "negative", "weight": 0.20, "lag_days": 0, "reason": "Steel is major input for construction"},
+        "copper": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Copper for electrical infra"},
+        "us_10y": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Higher rates = higher project financing costs"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "positive", "weight": 0.40, "reason": "Govt budget, capex allocation crucial"},
+        "global_recession": {"direction": "negative", "weight": 0.10, "reason": "FDI in infra declines"}
+      },
+      "social_weight": 0.05
+    },
+
+    "Power": {
+      "description": "Regulated, input cost sensitive (coal, gas)",
+      "macro": {
+        "natural_gas": {"direction": "negative", "weight": 0.20, "lag_days": 0, "reason": "Gas power plants affected by gas prices"},
+        "crude_brent": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Oil-based power generation costs"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "variable", "weight": 0.35, "reason": "Electricity tariffs, renewable policies"},
+        "middle_east": {"direction": "negative", "weight": 0.10, "reason": "Oil/gas supply affects power costs"}
+      },
+      "social_weight": 0.05
+    },
+
+    "Telecom": {
+      "description": "Capex heavy, domestic consumption driven",
+      "macro": {
+        "us_10y": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "Higher rates = higher debt servicing"},
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Equipment imports become expensive"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "variable", "weight": 0.40, "reason": "Spectrum auctions, AGR dues, 5G policies"},
+        "us_china_trade": {"direction": "positive", "weight": 0.10, "reason": "Huawei ban = opportunity for other vendors"}
+      },
+      "social_weight": 0.15
+    },
+
+    "Consumer": {
+      "description": "Discretionary consumption, sentiment driven",
+      "macro": {
+        "usdinr": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Imported luxury goods become expensive"},
+        "gold": {"direction": "negative", "weight": 0.10, "lag_days": 0, "reason": "Gold competes for discretionary spending"}
+      },
+      "geopolitical": {
+        "india_domestic": {"direction": "positive", "weight": 0.25, "reason": "Consumer confidence linked to economy"},
+        "global_recession": {"direction": "negative", "weight": 0.15, "reason": "Discretionary spending falls"}
+      },
+      "social_weight": 0.25
+    },
+
+    "Chemicals": {
+      "description": "Feedstock cost sensitive, export oriented",
+      "macro": {
+        "crude_brent": {"direction": "negative", "weight": 0.30, "lag_days": 0, "reason": "Petrochemical feedstock costs rise with oil"},
+        "natural_gas": {"direction": "negative", "weight": 0.15, "lag_days": 0, "reason": "Gas is feedstock for fertilizers"},
+        "usdinr": {"direction": "positive", "weight": 0.15, "lag_days": 0, "reason": "Export-oriented, benefits from weaker INR"}
+      },
+      "geopolitical": {
+        "us_china_trade": {"direction": "positive", "weight": 0.20, "reason": "India chemicals benefit from China+1"},
+        "russia_ukraine": {"direction": "variable", "weight": 0.10, "reason": "Fertilizer supply disruption"}
+      },
+      "social_weight": 0.10
+    }
+  },
+
+  "social_platforms": {
+    "reddit": {
+      "subreddits": {
+        "indian": ["IndianStreetBets", "DalalStreetTalks", "IndiaInvestments", "IndianStockMarket"],
+        "global": ["stocks", "wallstreetbets", "investing", "StockMarket"]
+      },
+      "weight": 0.35
+    },
+    "twitter": {
+      "cashtag_prefix": "$",
+      "influencer_handles": ["@markets", "@business", "@ETNOWlive", "@monaborkar", "@ABORKAT"],
+      "weight": 0.30
+    },
+    "stocktwits": {
+      "base_url": "https://api.stocktwits.com/api/2",
+      "weight": 0.25
+    },
+    "youtube": {
+      "channels": ["MoneyControl", "CNBC-TV18", "ET Now", "Zerodha Varsity"],
+      "weight": 0.10
+    }
+  },
+
+  "scoring_weights": {
+    "default": {
+      "macro": 0.40,
+      "geopolitical": 0.25,
+      "social": 0.35
+    },
+    "high_volatility": {
+      "macro": 0.50,
+      "geopolitical": 0.30,
+      "social": 0.20
+    },
+    "earnings_season": {
+      "macro": 0.30,
+      "geopolitical": 0.15,
+      "social": 0.55
+    }
+  },
+
+  "cache_ttl_seconds": {
+    "commodities": 300,
+    "currencies": 300,
+    "bonds": 600,
+    "indices": 300,
+    "geopolitical": 3600,
+    "social_reddit": 1800,
+    "social_twitter": 900,
+    "social_stocktwits": 600
+  }
+}

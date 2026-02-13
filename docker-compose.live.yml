@@ -1,0 +1,13 @@
+# Override for live trading:
+#   Zerodha:  docker compose -f docker-compose.yml -f docker-compose.live.yml up -d
+#   Upstox:   BROKER=upstox docker compose -f docker-compose.yml -f docker-compose.live.yml up -d
+#
+# IMPORTANT: Live mode skips the "I CONFIRM" prompt (no stdin in Docker).
+# Set TRADING_MODE=live in .env to bypass the confirmation.
+
+services:
+  trading-agent:
+    command: ["--live"]
+    environment:
+      - TZ=Asia/Kolkata
+      - TRADING_MODE=live
