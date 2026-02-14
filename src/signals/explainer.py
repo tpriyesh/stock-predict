@@ -1,22 +1,26 @@
 """
 Human-readable explanation generator for trading signals.
-Uses OpenAI for natural language generation with full reasoning lineage.
+Uses LLM provider system for rate limiting, quota tracking, and caching.
+Falls back to template-based explanations when LLM is unavailable.
 """
 from typing import Optional
 from datetime import datetime
-from openai import OpenAI
 from loguru import logger
 
 from config.settings import get_settings
+from providers.cache import get_response_cache
+from providers.quota import get_quota_manager
 from src.models.scoring import StockScore
 from src.storage.models import NewsArticle
+from utils.platform import now_ist, today_ist
 
 
 class SignalExplainer:
     """
     Generates human-readable explanations for trading signals.
 
-    Ensures full transparency with traceable reasoning.
+    Routes through the LLM provider system for quota/cache/rate-limit
+    integration instead of calling OpenAI directly.
     """
 
     EXPLANATION_PROMPT = """Generate a concise, actionable trading signal explanation.
@@ -53,12 +57,23 @@ Generate a 3-4 sentence explanation that:
 Keep it professional and fact-based. No fluff."""
 
     def __init__(self):
-        settings = get_settings()
-        if settings.openai_api_key:
-            self.client = OpenAI(api_key=settings.openai_api_key)
-        else:
-            self.client = None
-        self.model = settings.openai_model
+        self._llm_provider = None
+        self._cache = get_response_cache()
+        self._quota = get_quota_manager()
+        self._init_provider()
+
+    def _init_provider(self):
+        """Lazy-load the LLM provider from the provider registry."""
+        try:
+            from providers.llm import get_llm_providers
+            providers = get_llm_providers()
+            if providers:
+                self._llm_provider = providers[0]
+                logger.info(f"Explainer using LLM provider: {self._llm_provider.name}")
+            else:
+                logger.warning("No LLM providers available - using template explanations")
+        except Exception as e:
+            logger.warning(f"Failed to init LLM provider for explainer: {e}")
 
     def explain(
         self,
@@ -67,6 +82,9 @@ Keep it professional and fact-based. No fluff."""
     ) -> str:
         """
         Generate explanation for a stock score.
+
+        Uses cache to avoid redundant OpenAI calls for the same
+        stock/signal/confidence combination within the same day.
 
         Args:
             score: StockScore object
@@ -89,8 +107,22 @@ Keep it professional and fact-based. No fluff."""
             if news_items:
                 news_context = "\n".join(news_items)
 
-        if not self.client:
-            # Fallback to template-based explanation
+        if not self._llm_provider:
+            return self._template_explanation(score, news_context)
+
+        # Cache key: same stock + signal + confidence = same explanation
+        cache_key = (
+            f"explain:{score.symbol}:{score.signal.value}:"
+            f"{score.confidence:.2f}:{today_ist()}"
+        )
+        cached = self._cache.get("llm", cache_key)
+        if cached is not None:
+            return cached
+
+        # Check quota before calling LLM
+        allowed, reason = self._quota.can_request(self._llm_provider.name)
+        if not allowed:
+            logger.debug(f"Explainer LLM quota blocked: {reason}")
             return self._template_explanation(score, news_context)
 
         prompt = self.EXPLANATION_PROMPT.format(
@@ -112,21 +144,39 @@ Keep it professional and fact-based. No fluff."""
             news_context=news_context
         )
 
+        messages = [
+            {"role": "system", "content": "You are a financial analyst providing actionable trading signals."},
+            {"role": "user", "content": prompt}
+        ]
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a financial analyst providing actionable trading signals."},
-                    {"role": "user", "content": prompt}
-                ],
+            self._quota.wait_and_record(self._llm_provider.name)
+
+            result_text = self._llm_provider.complete(
+                messages=messages,
                 temperature=0.3,
-                max_tokens=300
+                max_tokens=300,
             )
 
-            return response.choices[0].message.content.strip()
+            if not result_text:
+                self._quota.record_failure(self._llm_provider.name)
+                return self._template_explanation(score, news_context)
+
+            self._quota.record_success(self._llm_provider.name)
+
+            explanation = result_text.strip()
+
+            # Cache for the rest of the trading day (6 hours)
+            self._cache.set("llm", cache_key, explanation, ttl_seconds=21600)
+
+            return explanation
 
         except Exception as e:
-            logger.error(f"OpenAI explanation failed: {e}")
+            logger.error(f"LLM explanation failed: {e}")
+            try:
+                self._quota.record_failure(self._llm_provider.name)
+            except Exception:
+                pass
             return self._template_explanation(score, news_context)
 
     def _template_explanation(self, score: StockScore, news_context: str) -> str:
@@ -155,7 +205,7 @@ Keep it professional and fact-based. No fluff."""
             explanation += f"• {reason}\n"
 
         if score.atr_pct > 3:
-            explanation += f"\n⚠️ **Risk Note**: High volatility (ATR {score.atr_pct:.1f}%)"
+            explanation += f"\n**Risk Note**: High volatility (ATR {score.atr_pct:.1f}%)"
 
         return explanation
 
@@ -177,7 +227,7 @@ Keep it professional and fact-based. No fluff."""
             Formatted daily summary
         """
         summary = f"""
-# Stock Predictions - {datetime.now().strftime('%Y-%m-%d %H:%M')}
+# Stock Predictions - {now_ist().replace(tzinfo=None).strftime('%Y-%m-%d %H:%M')}
 
 ## Market Context
 - **Regime**: {market_context.get('regime', {}).get('overall', 'N/A')}

@@ -199,9 +199,15 @@ class ScoringEngine:
             # SELL signals disabled - return HOLD instead
             signal = SignalType.HOLD
 
-        # Calculate trading levels
-        atr = float(latest.get('atr', current_price * 0.02))
-        atr_pct = float(latest.get('atr_pct', 2.0))
+        # Calculate trading levels — validate ATR before use
+        atr = float(latest.get('atr', 0))
+        atr_pct = float(latest.get('atr_pct', 0))
+
+        if atr <= 0:
+            # ATR missing or zero — use 2% fallback with confidence penalty
+            atr = current_price * 0.02
+            atr_pct = 2.0
+            reasons.append("[RISK] ATR unavailable - using 2% fallback")
 
         entry_price, stop_loss, target_price = self._calculate_levels(
             current_price, atr, signal, trade_type
@@ -215,6 +221,27 @@ class ScoringEngine:
 
         # Calibrate confidence
         confidence = self._calibrate_confidence(adjusted_score, atr_pct, liquidity_cr)
+
+        # Apply penalty for missing/fallback indicators (Fix 3 + Fix 8)
+        fallback_count = 0
+        if latest.get('atr', 0) == 0 or '[RISK] ATR unavailable' in str(reasons):
+            fallback_count += 1
+        if pd.isna(latest.get('rsi', float('nan'))) or latest.get('rsi', 0) == 0:
+            fallback_count += 1
+        if pd.isna(latest.get('trend_strength', float('nan'))) or latest.get('trend_strength', 0) == 0:
+            fallback_count += 1
+
+        if fallback_count > 0:
+            penalty = max(0.75, 1.0 - (fallback_count * 0.05))
+            confidence *= penalty
+            if fallback_count > 1:
+                reasons.append(f"[RISK] {fallback_count} indicators using fallback values")
+
+        # Apply penalty for no news data (Fix 6)
+        if any('[RISK] No news data available' in r for r in reasons):
+            confidence *= 0.90  # 10% penalty for trading without news context
+
+        confidence = round(min(0.80, max(0.35, confidence)), 3)
 
         return StockScore(
             symbol=symbol,

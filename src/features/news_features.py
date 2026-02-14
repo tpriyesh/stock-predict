@@ -5,6 +5,7 @@ Extracts structured information from news articles for trading signals.
 Uses the provider plugin system for rate limiting, quota tracking,
 and cost monitoring. Falls back gracefully if LLM is unavailable.
 """
+import hashlib
 import json
 import os
 from typing import Optional
@@ -94,8 +95,12 @@ Example output:
         if not self._llm_provider:
             return article
 
-        # Check cache first
-        cache_key = f"extract:{article.id}"
+        # Use URL-based cache key — stable across providers and re-fetches.
+        # Article IDs may vary when the same article is fetched from different
+        # providers, but the URL stays the same.
+        url_or_id = article.url or str(article.id)
+        stable_id = hashlib.md5(url_or_id.encode()).hexdigest()[:16]
+        cache_key = f"extract:{stable_id}"
         cached = self._cache.get("llm", cache_key)
         if cached is not None:
             return cached

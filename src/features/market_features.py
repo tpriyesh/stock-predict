@@ -1,12 +1,19 @@
 """
 Market-wide features for context and regime detection.
 """
+import os
+from datetime import datetime
 from typing import Optional
 import json
 from pathlib import Path
 from loguru import logger
 
 from src.data.market_indicators import MarketIndicators
+from utils.platform import now_ist
+
+
+# How long to cache the full market context (default 1 hour)
+_CONTEXT_CACHE_TTL = int(os.getenv("MARKET_CONTEXT_REFRESH_SECONDS", "3600"))
 
 
 class MarketFeatures:
@@ -16,6 +23,8 @@ class MarketFeatures:
 
     def __init__(self):
         self.indicators = MarketIndicators()
+        self._cached_context: Optional[dict] = None
+        self._context_cache_time: Optional[datetime] = None
         self._load_sector_mapping()
 
     def _load_sector_mapping(self):
@@ -40,9 +49,20 @@ class MarketFeatures:
         """
         Get comprehensive market context for trading decisions.
 
+        Cached for 1 hour — market regime, VIX, and sector strengths
+        change slowly and don't need per-cycle refresh.
+
         Returns:
             Dict with market regime, VIX, sector strengths, etc.
         """
+        # Return cached context if fresh
+        now = now_ist().replace(tzinfo=None)
+        if (self._cached_context is not None
+                and self._context_cache_time is not None
+                and (now - self._context_cache_time).total_seconds() < _CONTEXT_CACHE_TTL):
+            logger.debug("Using cached market context")
+            return self._cached_context
+
         context = {
             'timestamp': None,
             'regime': None,
@@ -68,6 +88,8 @@ class MarketFeatures:
         except Exception as e:
             logger.error(f"Failed to get market context: {e}")
 
+        self._cached_context = context
+        self._context_cache_time = now
         return context
 
     def get_sector_score(self, symbol: str, market_context: Optional[dict] = None) -> float:

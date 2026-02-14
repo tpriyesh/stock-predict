@@ -142,7 +142,9 @@ class NewsFetcher:
         if not all_articles and providers_tried == 0:
             logger.warning("No news providers available (all exhausted/unhealthy)")
 
-        # 3. Cache results (even empty, to prevent hammering)
+        # 3. Cache results if we got articles.
+        #    Don't cache empty results — `[]` is falsy in Python and causes
+        #    downstream confusion between "no articles found" and "not cached".
         if all_articles:
             self._cache.set("news", cache_key, all_articles,
                             ttl_seconds=self._news_cache_ttl)

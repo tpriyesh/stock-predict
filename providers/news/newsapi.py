@@ -6,7 +6,7 @@ Endpoint: https://newsapi.org/v2/everything
 """
 import hashlib
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import requests
@@ -45,12 +45,13 @@ class NewsAPIProvider(BaseNewsProvider):
     def fetch_articles(self, query: str, hours: int = 72,
                        max_results: int = 50) -> List[Article]:
         """Fetch articles from NewsAPI."""
-        from_date = datetime.utcnow() - timedelta(hours=hours)
+        now_utc = datetime.now(timezone.utc)
+        from_date = now_utc - timedelta(hours=hours)
 
         params = {
             "q": query,
             "from": from_date.strftime("%Y-%m-%d"),
-            "to": datetime.utcnow().strftime("%Y-%m-%d"),
+            "to": now_utc.strftime("%Y-%m-%d"),
             "language": "en",
             "sortBy": "publishedAt",
             "pageSize": min(max_results, 100),

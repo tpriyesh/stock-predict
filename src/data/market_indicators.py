@@ -1,6 +1,10 @@
 """
 Market-wide indicators: VIX, FII/DII flows, sector indices.
+
+Uses ResponseCache (1-hour TTL) and quota manager to avoid
+redundant yfinance calls — market indices change slowly.
 """
+import os
 from datetime import date, datetime, timedelta
 from typing import Optional
 import pandas as pd
@@ -8,6 +12,13 @@ import yfinance as yf
 from loguru import logger
 
 from src.data.price_fetcher import PriceFetcher
+from providers.cache import get_response_cache
+from providers.quota import get_quota_manager
+from utils.platform import yfinance_with_timeout, now_ist
+
+
+# Default cache TTL for market index data (1 hour)
+_INDEX_CACHE_TTL = int(os.getenv("MARKET_INDEX_CACHE_TTL", "3600"))
 
 
 class MarketIndicators:
@@ -46,6 +57,8 @@ class MarketIndicators:
 
     def __init__(self):
         self.price_fetcher = PriceFetcher()
+        self._cache = get_response_cache()
+        self._quota = get_quota_manager()
 
     def get_index_data(
         self,
@@ -53,7 +66,7 @@ class MarketIndicators:
         period: str = "1mo"
     ) -> pd.DataFrame:
         """
-        Get historical data for an index.
+        Get historical data for an index (cached for 1 hour).
 
         Args:
             index_name: Name from INDICES dict (e.g., 'NIFTY50', 'INDIAVIX')
@@ -66,15 +79,35 @@ class MarketIndicators:
             logger.warning(f"Unknown index: {index_name}")
             return pd.DataFrame()
 
+        # Check cache first
+        cache_key = f"index:{index_name}:{period}"
+        cached = self._cache.get("market_index", cache_key)
+        if cached is not None:
+            return cached
+
         yahoo_symbol = self.INDICES[index_name]
 
         try:
-            ticker = yf.Ticker(yahoo_symbol)
-            df = ticker.history(period=period)
+            # Rate limit via quota manager
+            allowed, reason = self._quota.can_request("yfinance")
+            if not allowed:
+                logger.debug(f"yfinance blocked for {index_name}: {reason}")
+                return pd.DataFrame()
+
+            self._quota.wait_and_record("yfinance")
+
+            def _fetch():
+                ticker = yf.Ticker(yahoo_symbol)
+                return ticker.history(period=period)
+
+            df = yfinance_with_timeout(_fetch, timeout_seconds=30)
 
             if df.empty:
                 logger.warning(f"No data for {index_name}")
+                self._quota.record_success("yfinance")
                 return pd.DataFrame()
+
+            self._quota.record_success("yfinance")
 
             df = df.rename(columns={
                 'Open': 'open',
@@ -84,10 +117,18 @@ class MarketIndicators:
                 'Volume': 'volume'
             })
 
+            # Cache for 1 hour — market indices change slowly
+            self._cache.set("market_index", cache_key, df,
+                            ttl_seconds=_INDEX_CACHE_TTL)
+
             return df
 
         except Exception as e:
             logger.error(f"Failed to fetch {index_name}: {e}")
+            try:
+                self._quota.record_failure("yfinance")
+            except Exception:
+                pass
             return pd.DataFrame()
 
     def get_vix(self, period: str = "1mo") -> pd.DataFrame:
@@ -113,7 +154,7 @@ class MarketIndicators:
             Dict with regime classification and supporting data
         """
         regime = {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': now_ist().replace(tzinfo=None).isoformat(),
             'overall': 'NEUTRAL',
             'vix_level': None,
             'vix_regime': 'NORMAL',

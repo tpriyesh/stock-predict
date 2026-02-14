@@ -57,6 +57,10 @@ class SignalGenerator:
             db_path = settings.db_path
         self.db = Database(db_path)
 
+        # Daily price cache — daily candles don't change intraday
+        self._daily_price_cache: dict[str, pd.DataFrame] = {}
+        self._daily_price_cache_date: Optional[date] = None
+
         # Load universe
         self._load_universe()
 
@@ -143,6 +147,8 @@ class SignalGenerator:
                 news_reasons.append(f"[NEWS] {news_summary.get('article_count')} articles, {sentiment} sentiment")
                 if news_summary.get('recent_claims'):
                     news_reasons.append(f"[NEWS] {news_summary['recent_claims'][0][:100]}")
+            else:
+                news_reasons.append("[RISK] No news data available - trading on technicals only")
 
             try:
                 if include_intraday:
@@ -232,11 +238,35 @@ class SignalGenerator:
         }
 
     def _fetch_all_prices(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
-        """Fetch price data for all symbols with freshness validation."""
-        price_data = {}
-        stale_count = 0
+        """Fetch price data for all symbols with daily caching.
 
-        for symbol in symbols:
+        Daily candles don't change intraday — once fetched, they're valid
+        for the entire trading day. Only fetches symbols not already cached.
+        """
+        today = today_ist()
+
+        # Invalidate cache on new trading day
+        if self._daily_price_cache_date != today:
+            self._daily_price_cache.clear()
+            self._daily_price_cache_date = today
+
+        # Identify symbols that need fetching
+        uncached = [s for s in symbols if s not in self._daily_price_cache]
+        cached_count = len(symbols) - len(uncached)
+
+        if not uncached:
+            logger.info(f"All {len(symbols)} symbols using daily price cache")
+            return {s: self._daily_price_cache[s] for s in symbols
+                    if s in self._daily_price_cache}
+
+        if cached_count > 0:
+            logger.info(
+                f"Fetching price data for {len(uncached)} symbols "
+                f"({cached_count} cached)"
+            )
+
+        stale_count = 0
+        for symbol in uncached:
             try:
                 prices = self.price_fetcher.fetch_prices(symbol, period="1y")
                 if prices:
@@ -247,7 +277,7 @@ class SignalGenerator:
                     # Data freshness check: reject data older than 3 trading days
                     latest_date = df.index.max().date() if not df.empty else None
                     if latest_date:
-                        days_stale = (today_ist() - latest_date).days
+                        days_stale = (today - latest_date).days
                         # Allow weekends (2 days) + 1 buffer = 3 days
                         if days_stale > 5:
                             logger.warning(
@@ -264,17 +294,27 @@ class SignalGenerator:
                             logger.warning(f"{symbol}: Latest close is NaN, SKIPPING")
                             continue
 
-                    price_data[symbol] = df
+                    self._daily_price_cache[symbol] = df
             except Exception as e:
                 logger.warning(f"Failed to fetch {symbol}: {e}")
 
         if stale_count > 0:
             logger.warning(f"Skipped {stale_count} symbols due to stale data")
-        logger.info(f"Fetched price data for {len(price_data)}/{len(symbols)} symbols")
-        return price_data
+        logger.info(f"Fetched price data for {len(self._daily_price_cache)}/{len(symbols)} symbols")
+
+        return {s: self._daily_price_cache[s] for s in symbols
+                if s in self._daily_price_cache}
 
     def _fetch_and_analyze_news(self, symbols: list[str]) -> dict:
-        """Fetch and analyze news for all symbols."""
+        """Fetch and analyze news with budget-aware fetching.
+
+        Limits per-symbol news API calls to NEWS_BUDGET_PER_CYCLE to stay
+        within free tier limits (NewsAPI: 100/day, GNews: 100/day).
+        Symbols with cached news data are served from cache.
+        """
+        from providers.cache import get_response_cache
+        cache = get_response_cache()
+
         news_data = {}
 
         # Fetch general market news (limit LLM extraction to top 15)
@@ -282,33 +322,79 @@ class SignalGenerator:
         if market_news:
             market_news = self.news_extractor.extract_batch(market_news[:15])
 
+        # Budget: limit fresh news API calls per cycle
+        try:
+            from config.trading_config import CONFIG
+            budget = CONFIG.providers.news_budget_per_cycle
+        except Exception:
+            budget = 15
+
+        # Separate symbols into cached vs needs-fetch.
+        # The news cache stores raw Article objects. We convert them to
+        # NewsArticle and run LLM extraction (which has its own 6-hour cache).
+        uncached_symbols = []
         for symbol in symbols:
+            cache_key = f"news:{symbol}:{self.settings.news_lookback_hours}"
+            cached = cache.get("news", cache_key)
+            if cached is not None and len(cached) > 0:
+                # Use cached articles — no news API call needed
+                try:
+                    from src.data.news_fetcher import _article_to_news_article
+                    articles = [_article_to_news_article(a) for a in cached]
+                    # LLM extraction has its own 6-hour cache (keyed by URL),
+                    # so re-extracting cached articles is essentially free
+                    articles = self.news_extractor.extract_batch(articles[:5])
+                    summary = self.news_extractor.get_symbol_news_summary(articles, symbol)
+                    summary['articles'] = articles
+                    news_data[symbol] = summary
+                except Exception:
+                    uncached_symbols.append(symbol)
+            else:
+                uncached_symbols.append(symbol)
+
+        # Only fetch for budget-limited subset
+        symbols_to_fetch = uncached_symbols[:budget]
+        skipped = len(uncached_symbols) - len(symbols_to_fetch)
+        if skipped > 0:
+            logger.info(
+                f"News fetch: {len(symbols_to_fetch)}/{len(symbols)} symbols "
+                f"(budget={budget}, {len(symbols) - len(uncached_symbols)} cached, "
+                f"{skipped} deferred)"
+            )
+
+        for symbol in symbols_to_fetch:
             try:
-                # Get symbol-specific news
                 articles = self.news_fetcher.fetch_for_symbol(
                     symbol,
                     hours=self.settings.news_lookback_hours
                 )
 
                 if articles:
-                    # Limit to top 5 articles per stock for LLM extraction
-                    # (reduces OpenAI calls from ~500 to ~250 per cycle)
                     articles = self.news_extractor.extract_batch(articles[:5])
-
-                    # Get summary
                     summary = self.news_extractor.get_symbol_news_summary(articles, symbol)
                     summary['articles'] = articles
                     news_data[symbol] = summary
                 else:
                     # Check if mentioned in market news
+                    if market_news:
+                        relevant = [a for a in market_news if symbol in a.tickers]
+                        if relevant:
+                            summary = self.news_extractor.get_symbol_news_summary(relevant, symbol)
+                            summary['articles'] = relevant
+                            news_data[symbol] = summary
+
+            except Exception as e:
+                logger.warning(f"News fetch failed for {symbol}: {e}")
+
+        # For skipped symbols, check market news as fallback
+        if market_news:
+            for symbol in uncached_symbols[budget:]:
+                if symbol not in news_data:
                     relevant = [a for a in market_news if symbol in a.tickers]
                     if relevant:
                         summary = self.news_extractor.get_symbol_news_summary(relevant, symbol)
                         summary['articles'] = relevant
                         news_data[symbol] = summary
-
-            except Exception as e:
-                logger.warning(f"News fetch failed for {symbol}: {e}")
 
         logger.info(f"Analyzed news for {len(news_data)} symbols")
         return news_data

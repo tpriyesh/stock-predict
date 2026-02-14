@@ -1,0 +1,30 @@
+[Unit]
+Description=Stock Trading Agent
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=%WORKING_DIR%
+Environment="PATH=%WORKING_DIR%/venv/bin"
+EnvironmentFile=%WORKING_DIR%/.env
+ExecStart=%WORKING_DIR%/venv/bin/python %WORKING_DIR%/start.py --live
+ExecStop=%WORKING_DIR%/venv/bin/python %WORKING_DIR%/trade.py stop
+Restart=on-failure
+RestartSec=60
+StartLimitInterval=300
+StartLimitBurst=3
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%WORKING_DIR%/data %WORKING_DIR%/logs
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-agent
+
+[Install]
+WantedBy=multi-user.target

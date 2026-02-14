@@ -21,6 +21,8 @@ from typing import Callable, Any, Optional
 from functools import wraps
 from loguru import logger
 
+from utils.platform import now_ist
+
 
 class RateLimiter:
     """
@@ -67,7 +69,7 @@ class RateLimiter:
         sleep_time = 0.0
 
         with self._lock:
-            now = datetime.now()
+            now = now_ist().replace(tzinfo=None)
 
             # Check if this endpoint is in cooldown
             cooldown = self._cooldown_until.get(endpoint)
@@ -81,7 +83,7 @@ class RateLimiter:
 
         sleep_time = 0.0
         with self._lock:
-            now = datetime.now()
+            now = now_ist().replace(tzinfo=None)
 
             # Clean old request times (keep last minute)
             cutoff = now - timedelta(minutes=1)
@@ -99,7 +101,7 @@ class RateLimiter:
 
         sleep_time = 0.0
         with self._lock:
-            now = datetime.now()
+            now = now_ist().replace(tzinfo=None)
 
             # Check per-second burst limit
             one_second_ago = now - timedelta(seconds=1)
@@ -113,7 +115,7 @@ class RateLimiter:
 
         # Record this request
         with self._lock:
-            self._request_times.append(datetime.now())
+            self._request_times.append(now_ist().replace(tzinfo=None))
 
     def record_success(self, endpoint: str = "default") -> None:
         """Record successful API call - resets failure count."""
@@ -133,7 +135,7 @@ class RateLimiter:
         """
         with self._lock:
             self._failure_counts[endpoint] += 1
-            self._last_failure_time[endpoint] = datetime.now()
+            self._last_failure_time[endpoint] = now_ist().replace(tzinfo=None)
 
             failures = self._failure_counts[endpoint]
 
@@ -149,7 +151,7 @@ class RateLimiter:
             # If rate limited, enter per-endpoint cooldown mode
             if is_rate_limit:
                 cooldown_time = total_backoff * 2
-                self._cooldown_until[endpoint] = datetime.now() + timedelta(seconds=cooldown_time)
+                self._cooldown_until[endpoint] = now_ist().replace(tzinfo=None) + timedelta(seconds=cooldown_time)
                 logger.warning(f"Rate limit hit on {endpoint}! Cooldown for {cooldown_time:.1f}s")
 
             logger.warning(

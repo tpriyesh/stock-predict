@@ -7,7 +7,7 @@ Financial-specific news with built-in sentiment.
 """
 import hashlib
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import requests
@@ -56,8 +56,9 @@ class FinnhubNewsProvider(BaseNewsProvider):
 
         # Finnhub expects international symbols; for NSE use .NS suffix
         # But also try general market news endpoint
-        from_date = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d")
-        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        now_utc = datetime.now(timezone.utc)
+        from_date = (now_utc - timedelta(hours=hours)).strftime("%Y-%m-%d")
+        to_date = now_utc.strftime("%Y-%m-%d")
 
         articles = []
 
@@ -107,7 +108,7 @@ class FinnhubNewsProvider(BaseNewsProvider):
                 url_str = item.get("url", "")
                 # Finnhub timestamps are Unix epoch
                 pub_ts = item.get("datetime", 0)
-                pub_date = datetime.utcfromtimestamp(pub_ts) if pub_ts else datetime.utcnow()
+                pub_date = datetime.fromtimestamp(pub_ts, tz=timezone.utc) if pub_ts else datetime.now(timezone.utc)
 
                 articles.append(Article(
                     id=hashlib.md5(url_str.encode()).hexdigest()[:16],
@@ -149,7 +150,7 @@ class FinnhubNewsProvider(BaseNewsProvider):
                 try:
                     url_str = item.get("url", "")
                     pub_ts = item.get("datetime", 0)
-                    pub_date = datetime.utcfromtimestamp(pub_ts) if pub_ts else datetime.utcnow()
+                    pub_date = datetime.fromtimestamp(pub_ts, tz=timezone.utc) if pub_ts else datetime.now(timezone.utc)
 
                     articles.append(Article(
                         id=hashlib.md5(url_str.encode()).hexdigest()[:16],

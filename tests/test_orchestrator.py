@@ -430,7 +430,7 @@ def test_shutdown_exits_positions(mock_broker, risk_manager):
     mock_broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
     mock_broker.set_ltp("RELIANCE", 2500.0)
 
-    with patch.object(orch, '_exit_all_positions') as mock_exit, \
+    with patch.object(orch, '_parallel_exit_all') as mock_exit, \
          patch.object(orch, '_generate_daily_report'):
         orch._shutdown()
         mock_exit.assert_called_once_with("Agent shutdown")

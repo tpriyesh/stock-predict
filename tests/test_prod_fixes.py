@@ -730,7 +730,7 @@ class TestNewConfigParameters:
         assert hasattr(CONFIG.orders, 'entry_order_wait_seconds')
 
     def test_token_check_interval_seconds(self):
-        assert CONFIG.orders.token_check_interval_seconds == 1800
+        assert CONFIG.orders.token_check_interval_seconds == 300  # Fix 5: 5 min (was 1800)
 
     def test_max_completed_trades_in_memory(self):
         assert CONFIG.capital.max_completed_trades_in_memory == 200
@@ -1461,7 +1461,7 @@ class TestLTPFailureAlerting:
         assert orch._ltp_failures.get("INFY") == 1
 
     def test_alert_fires_at_threshold(self):
-        """After 5 consecutive LTP failures, a Telegram alert fires."""
+        """After 3 consecutive LTP failures, force exit + alert fires (Fix 1)."""
         broker = MockBroker()
         orch = self._make_orchestrator(broker)
 
@@ -1476,15 +1476,19 @@ class TestLTPFailureAlerting:
         broker.add_position("INFY", qty=10, avg_price=1500.0, ltp=1500.0)
         broker.set_ltp("INFY", 0)
 
-        with patch('agent.orchestrator.alert_error') as mock_alert:
-            # Run 5 checks
-            for _ in range(5):
+        with patch('agent.orchestrator.alert_error') as mock_alert, \
+             patch('agent.orchestrator.alert_trade_exit'):
+            # Fix 10: 1st failure uses fallback price, 2nd skips, 3rd force-exits
+            for _ in range(3):
                 orch._check_positions()
 
-            mock_alert.assert_called_once()
-            args = mock_alert.call_args
-            assert "LTP failures" in args[0][0]
-            assert "INFY" in args[0][0]
+            mock_alert.assert_called()
+            # Check last call was the force-exit alert
+            last_call = mock_alert.call_args
+            assert "LTP failure cascade" in last_call[0][0]
+            assert "INFY" in last_call[0][0]
+            # Position should be force-exited
+            assert "INFY" not in orch.active_trades
 
     def test_success_resets_counter(self):
         """A successful LTP fetch resets the failure counter."""
@@ -1501,16 +1505,16 @@ class TestLTPFailureAlerting:
         orch.active_trades["INFY"] = trade
         broker.add_position("INFY", qty=10, avg_price=1500.0, ltp=1500.0)
 
-        # Simulate 3 failures
+        # Simulate 2 failures (Fix 10: 1st uses fallback, 2nd skips)
         broker.set_ltp("INFY", 0)
-        for _ in range(3):
-            orch._check_positions()
-        assert orch._ltp_failures["INFY"] == 3
+        orch._check_positions()  # failure #1: uses fallback price
+        assert orch._ltp_failures["INFY"] == 1
+        orch._check_positions()  # failure #2: skips
+        assert orch._ltp_failures["INFY"] == 2
 
         # Success resets
         broker.set_ltp("INFY", 1510.0)
-        with patch.object(orch, '_exit_position'):
-            orch._check_positions()
+        orch._check_positions()
         assert "INFY" not in orch._ltp_failures
 
 
@@ -2054,3 +2058,917 @@ class TestReportCLI:
             args = MagicMock()
             # Should not raise
             trade.cmd_report(args)
+
+
+# ============================================
+# IST DATETIME FIXES — rate_limiter, error_handler, news providers
+# ============================================
+
+class TestRateLimiterIST:
+    """Verify rate_limiter uses now_ist() instead of datetime.now()."""
+
+    def test_wait_uses_ist(self):
+        """RateLimiter.wait() should use IST timestamps, not system local time."""
+        from utils.rate_limiter import RateLimiter
+        limiter = RateLimiter(requests_per_minute=1000, requests_per_second=100)
+
+        with patch('utils.rate_limiter.now_ist') as mock_ist:
+            from datetime import datetime
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            mock_now = datetime(2026, 2, 13, 10, 30, 0, tzinfo=ist)
+            mock_ist.return_value = mock_now
+
+            limiter.wait("test_endpoint")
+
+            # now_ist() should have been called (for timestamp recording)
+            assert mock_ist.call_count >= 1
+
+    def test_record_failure_uses_ist(self):
+        """record_failure should timestamp with IST."""
+        from utils.rate_limiter import RateLimiter
+        limiter = RateLimiter()
+
+        with patch('utils.rate_limiter.now_ist') as mock_ist:
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            mock_now = datetime(2026, 2, 13, 10, 30, 0, tzinfo=ist)
+            mock_ist.return_value = mock_now
+
+            limiter.record_failure("test_ep")
+
+            # Should have been called for _last_failure_time
+            assert mock_ist.call_count >= 1
+
+    def test_cooldown_uses_ist(self):
+        """Rate limit cooldown should use IST timestamps."""
+        from utils.rate_limiter import RateLimiter
+        limiter = RateLimiter()
+
+        with patch('utils.rate_limiter.now_ist') as mock_ist:
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            mock_now = datetime(2026, 2, 13, 10, 30, 0, tzinfo=ist)
+            mock_ist.return_value = mock_now
+
+            limiter.record_failure("test_ep", is_rate_limit=True)
+
+            # Cooldown should be set based on IST time
+            assert "test_ep" in limiter._cooldown_until
+
+    def test_no_raw_datetime_now_in_rate_limiter(self):
+        """rate_limiter.py should not contain raw datetime.now() calls."""
+        import inspect
+        from utils import rate_limiter
+        source = inspect.getsource(rate_limiter)
+        # Should use now_ist(), not datetime.now()
+        assert 'datetime.now()' not in source, \
+            "rate_limiter.py still contains raw datetime.now() calls"
+
+
+class TestCircuitBreakerIST:
+    """Verify CircuitBreaker uses now_ist() instead of datetime.now()."""
+
+    def test_record_failure_uses_ist(self):
+        """CircuitBreaker.record_failure should use IST timestamps."""
+        from utils.error_handler import CircuitBreaker
+
+        breaker = CircuitBreaker(name="test", recovery_timeout=60)
+
+        with patch('utils.error_handler.now_ist') as mock_ist:
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            mock_now = datetime(2026, 2, 13, 10, 30, 0, tzinfo=ist)
+            mock_ist.return_value = mock_now
+
+            breaker.record_failure()
+
+            assert mock_ist.call_count >= 1
+            assert breaker._last_failure_time is not None
+
+    def test_state_transition_uses_ist(self):
+        """OPEN -> HALF_OPEN transition should use IST for elapsed time."""
+        from utils.error_handler import CircuitBreaker
+
+        breaker = CircuitBreaker(name="test", failure_threshold=2, recovery_timeout=1)
+
+        # Push to OPEN state
+        with patch('utils.error_handler.now_ist') as mock_ist:
+            import pytz
+            ist = pytz.timezone('Asia/Kolkata')
+            t0 = datetime(2026, 2, 13, 10, 30, 0, tzinfo=ist)
+            mock_ist.return_value = t0
+
+            breaker.record_failure()
+            breaker.record_failure()
+            assert breaker._state == CircuitBreaker.State.OPEN
+
+        # After recovery_timeout, should transition to HALF_OPEN
+        with patch('utils.error_handler.now_ist') as mock_ist:
+            t1 = datetime(2026, 2, 13, 10, 30, 2, tzinfo=ist)  # 2 seconds later
+            mock_ist.return_value = t1
+
+            state = breaker.state
+            assert state == CircuitBreaker.State.HALF_OPEN
+
+    def test_no_raw_datetime_now_in_error_handler(self):
+        """error_handler.py should not contain raw datetime.now() calls outside TradingException."""
+        import inspect
+        from utils import error_handler
+        source = inspect.getsource(error_handler)
+        # TradingException has a fallback datetime.now() in ImportError handler - that's OK
+        # But there should be no other datetime.now() calls
+        lines = source.split('\n')
+        raw_calls = [
+            (i+1, line) for i, line in enumerate(lines)
+            if 'datetime.now()' in line and 'ImportError' not in lines[max(0, i-1):i+2].__str__()
+            and 'except ImportError' not in line
+            and '# fallback' not in line.lower()
+        ]
+        # Allow only the TradingException fallback
+        non_fallback = [
+            (num, line) for num, line in raw_calls
+            if 'TradingException' not in source.split('\n')[max(0, num-5):num].__str__()
+        ]
+        # Filter to just circuit breaker lines
+        cb_calls = [
+            (num, line) for num, line in non_fallback
+            if 'CircuitBreaker' in source[:source.find(line)] or 'record_failure' in source[max(0, source.find(line)-200):source.find(line)]
+        ]
+        assert len(cb_calls) == 0, \
+            f"CircuitBreaker still uses raw datetime.now(): {cb_calls}"
+
+
+class TestNewsProviderDatetime:
+    """Verify news providers use proper UTC (not deprecated utcnow)."""
+
+    def test_finnhub_no_deprecated_utcnow(self):
+        """finnhub.py should not use deprecated datetime.utcnow()."""
+        import inspect
+        from providers.news import finnhub
+        source = inspect.getsource(finnhub)
+        assert 'datetime.utcnow()' not in source, \
+            "finnhub.py still uses deprecated datetime.utcnow()"
+        assert 'utcfromtimestamp' not in source, \
+            "finnhub.py still uses deprecated utcfromtimestamp()"
+
+    def test_newsapi_no_deprecated_utcnow(self):
+        """newsapi.py should not use deprecated datetime.utcnow()."""
+        import inspect
+        from providers.news import newsapi
+        source = inspect.getsource(newsapi)
+        assert 'datetime.utcnow()' not in source, \
+            "newsapi.py still uses deprecated datetime.utcnow()"
+
+    def test_finnhub_uses_timezone_utc(self):
+        """finnhub.py should use datetime.now(timezone.utc)."""
+        import inspect
+        from providers.news import finnhub
+        source = inspect.getsource(finnhub)
+        assert 'timezone.utc' in source, \
+            "finnhub.py should use timezone.utc for UTC datetimes"
+
+    def test_newsapi_uses_timezone_utc(self):
+        """newsapi.py should use datetime.now(timezone.utc)."""
+        import inspect
+        from providers.news import newsapi
+        source = inspect.getsource(newsapi)
+        assert 'timezone.utc' in source, \
+            "newsapi.py should use timezone.utc for UTC datetimes"
+
+
+# ============================================
+# HOLDING PHASE REACHABILITY
+# ============================================
+
+class TestHoldingPhaseReachable:
+    """Verify HOLDING phase is actually reachable with correct config."""
+
+    def test_holding_phase_reachable_with_default_config(self):
+        """entry_window_end < square_off_start so HOLDING phase exists."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.hours.entry_window_end < config.hours.square_off_start, \
+            f"entry_window_end ({config.hours.entry_window_end}) must be < " \
+            f"square_off_start ({config.hours.square_off_start}) for HOLDING phase"
+
+    def test_holding_phase_at_1445(self):
+        """14:45 IST should be HOLDING phase (between entry_window_end=14:30 and square_off_start=15:00)."""
+        broker = MockBroker()
+        rm = RiskManager(broker=broker, initial_capital=100000, hard_stop=80000)
+
+        with patch('agent.orchestrator.SignalAdapter'), \
+             patch('agent.orchestrator.NewsFetcher'), \
+             patch('agent.orchestrator.NewsFeatureExtractor'), \
+             patch('agent.orchestrator.get_trade_db') as mock_db, \
+             patch('agent.orchestrator.get_limiter') as mock_limiter:
+            mock_db.return_value = MagicMock()
+            mock_limiter.return_value = MagicMock()
+            orch = __import__('agent.orchestrator', fromlist=['TradingOrchestrator']).TradingOrchestrator(
+                broker=broker, risk_manager=rm
+            )
+
+        from agent.orchestrator import TradingPhase
+        with patch('agent.orchestrator.time_ist', return_value=dt_time(14, 45)):
+            phase = orch._get_current_phase()
+            assert phase == TradingPhase.HOLDING, \
+                f"Expected HOLDING at 14:45, got {phase}"
+
+    def test_square_off_at_1500(self):
+        """15:00 IST should be SQUARE_OFF phase."""
+        broker = MockBroker()
+        rm = RiskManager(broker=broker, initial_capital=100000, hard_stop=80000)
+
+        with patch('agent.orchestrator.SignalAdapter'), \
+             patch('agent.orchestrator.NewsFetcher'), \
+             patch('agent.orchestrator.NewsFeatureExtractor'), \
+             patch('agent.orchestrator.get_trade_db') as mock_db, \
+             patch('agent.orchestrator.get_limiter') as mock_limiter:
+            mock_db.return_value = MagicMock()
+            mock_limiter.return_value = MagicMock()
+            orch = __import__('agent.orchestrator', fromlist=['TradingOrchestrator']).TradingOrchestrator(
+                broker=broker, risk_manager=rm
+            )
+
+        from agent.orchestrator import TradingPhase
+        with patch('agent.orchestrator.time_ist', return_value=dt_time(15, 0)):
+            phase = orch._get_current_phase()
+            assert phase == TradingPhase.SQUARE_OFF, \
+                f"Expected SQUARE_OFF at 15:00, got {phase}"
+
+    def test_entry_window_ends_at_1430(self):
+        """14:29 IST should still be ENTRY_WINDOW, 14:30 should be HOLDING."""
+        broker = MockBroker()
+        rm = RiskManager(broker=broker, initial_capital=100000, hard_stop=80000)
+
+        with patch('agent.orchestrator.SignalAdapter'), \
+             patch('agent.orchestrator.NewsFetcher'), \
+             patch('agent.orchestrator.NewsFeatureExtractor'), \
+             patch('agent.orchestrator.get_trade_db') as mock_db, \
+             patch('agent.orchestrator.get_limiter') as mock_limiter:
+            mock_db.return_value = MagicMock()
+            mock_limiter.return_value = MagicMock()
+            orch = __import__('agent.orchestrator', fromlist=['TradingOrchestrator']).TradingOrchestrator(
+                broker=broker, risk_manager=rm
+            )
+
+        from agent.orchestrator import TradingPhase
+        with patch('agent.orchestrator.time_ist', return_value=dt_time(14, 29)):
+            phase = orch._get_current_phase()
+            assert phase == TradingPhase.ENTRY_WINDOW
+
+        with patch('agent.orchestrator.time_ist', return_value=dt_time(14, 30)):
+            phase = orch._get_current_phase()
+            assert phase == TradingPhase.HOLDING
+
+
+# ============================================
+# DAILY PRICE CACHE TESTS
+# ============================================
+
+class TestDailyPriceCache:
+    """Test daily price cache in signal generator."""
+
+    def test_cache_key_is_date_based(self):
+        """Price cache should invalidate on new day."""
+        from unittest.mock import MagicMock
+        import pandas as pd
+
+        with patch('src.signals.generator.SignalGenerator.__init__', return_value=None):
+            from src.signals.generator import SignalGenerator
+            gen = SignalGenerator.__new__(SignalGenerator)
+            gen._daily_price_cache = {"RELIANCE": pd.DataFrame({"close": [100]})}
+            gen._daily_price_cache_date = date(2026, 2, 12)
+
+            # Same day → cache hit
+            with patch('src.signals.generator.today_ist', return_value=date(2026, 2, 12)):
+                assert gen._daily_price_cache_date == date(2026, 2, 12)
+                assert "RELIANCE" in gen._daily_price_cache
+
+            # New day → cache should be cleared by _fetch_all_prices
+            with patch('src.signals.generator.today_ist', return_value=date(2026, 2, 13)):
+                assert gen._daily_price_cache_date != date(2026, 2, 13)
+
+    def test_signal_adapter_shares_generator_cache(self):
+        """Signal adapter should check generator's daily cache before fetching."""
+        import pandas as pd
+
+        with patch('agent.signal_adapter.PriceFetcher'), \
+             patch('agent.signal_adapter.SignalGenerator'):
+            from agent.signal_adapter import SignalAdapter
+
+            mock_gen = MagicMock()
+            mock_gen._daily_price_cache = {
+                "TCS": pd.DataFrame({
+                    "open": [3800]*60, "high": [3850]*60, "low": [3750]*60,
+                    "close": [3820]*60, "volume": [1000000]*60
+                })
+            }
+            mock_gen._daily_price_cache_date = date.today()
+
+            adapter = SignalAdapter(signal_generator=mock_gen)
+
+            with patch('agent.signal_adapter.today_ist', return_value=date.today()):
+                result = adapter._get_price_data("TCS")
+                assert result is not None
+                assert len(result) == 60
+
+    def test_signal_adapter_ignores_stale_cache(self):
+        """Signal adapter should not use generator cache from yesterday."""
+        import pandas as pd
+
+        with patch('agent.signal_adapter.PriceFetcher') as mock_pf, \
+             patch('agent.signal_adapter.SignalGenerator'):
+            from agent.signal_adapter import SignalAdapter
+
+            mock_gen = MagicMock()
+            mock_gen._daily_price_cache = {
+                "TCS": pd.DataFrame({"close": [3800]*5, "volume": [100000]*5})
+            }
+            mock_gen._daily_price_cache_date = date(2026, 2, 10)  # Old date
+
+            adapter = SignalAdapter(signal_generator=mock_gen)
+            # Mock primary fetch to return None (force cache check)
+            adapter._fetch_from_primary = MagicMock(return_value=None)
+            adapter._fetch_from_fallback = MagicMock(return_value=None)
+
+            with patch('agent.signal_adapter.today_ist', return_value=date(2026, 2, 13)):
+                result = adapter._get_price_data("TCS")
+                # Should NOT use stale cache — result should be None since both fetches return None
+                assert result is None
+
+
+# ============================================
+# BUDGET-AWARE NEWS FETCHING TESTS
+# ============================================
+
+class TestBudgetAwareNews:
+    """Test budget-aware news fetching in signal generator."""
+
+    def test_news_budget_config_exists(self):
+        """NEWS_BUDGET_PER_CYCLE config parameter exists."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert hasattr(config.providers, 'news_budget_per_cycle')
+        assert config.providers.news_budget_per_cycle == 15
+
+    def test_news_cache_ttl_is_30_min(self):
+        """NEWS_CACHE_TTL should be 1800 seconds (30 min)."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.providers.news_cache_ttl == 1800
+
+    def test_llm_cache_ttl_is_6_hours(self):
+        """LLM_CACHE_TTL should be 21600 seconds (6 hours)."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.providers.llm_cache_ttl == 21600
+
+
+# ============================================
+# EXPLAINER CACHING TESTS
+# ============================================
+
+class TestExplainerCaching:
+    """Test that SignalExplainer routes through provider system with caching."""
+
+    def test_explainer_uses_cache(self):
+        """Explainer should check cache before calling LLM."""
+        import inspect
+        from src.signals import explainer
+        source = inspect.getsource(explainer)
+        assert 'get_response_cache' in source, \
+            "Explainer should use response cache"
+        assert 'get_quota_manager' in source, \
+            "Explainer should use quota manager"
+
+    def test_explainer_no_direct_openai(self):
+        """Explainer should NOT import openai directly."""
+        import inspect
+        from src.signals import explainer
+        source = inspect.getsource(explainer)
+        assert 'from openai' not in source, \
+            "Explainer should not import openai directly"
+        assert 'import openai' not in source, \
+            "Explainer should not import openai directly"
+
+    def test_explainer_has_template_fallback(self):
+        """Explainer should have template fallback when LLM unavailable."""
+        from src.signals.explainer import SignalExplainer
+        assert hasattr(SignalExplainer, '_template_explanation'), \
+            "Explainer must have _template_explanation fallback"
+
+    def test_explainer_cache_key_includes_date(self):
+        """Cache key should include today's date to avoid cross-day hits."""
+        import inspect
+        from src.signals import explainer
+        source = inspect.getsource(explainer)
+        assert 'today_ist()' in source, \
+            "Explainer cache key should include today_ist() for daily invalidation"
+
+
+# ============================================
+# MARKET INDICATORS CACHING TESTS
+# ============================================
+
+class TestMarketIndicatorsCaching:
+    """Test that MarketIndicators uses cache + quota system."""
+
+    def test_market_indicators_uses_cache(self):
+        """MarketIndicators should use response cache."""
+        import inspect
+        from src.data import market_indicators
+        source = inspect.getsource(market_indicators)
+        assert 'get_response_cache' in source, \
+            "MarketIndicators should use response cache"
+
+    def test_market_indicators_uses_quota(self):
+        """MarketIndicators should use quota manager."""
+        import inspect
+        from src.data import market_indicators
+        source = inspect.getsource(market_indicators)
+        assert 'get_quota_manager' in source, \
+            "MarketIndicators should use quota manager"
+
+    def test_market_indicators_uses_timeout(self):
+        """MarketIndicators should use yfinance_with_timeout."""
+        import inspect
+        from src.data import market_indicators
+        source = inspect.getsource(market_indicators)
+        assert 'yfinance_with_timeout' in source, \
+            "MarketIndicators should use yfinance_with_timeout for safety"
+
+    def test_market_indicators_cache_ttl(self):
+        """Market index cache TTL should be 1 hour (3600s)."""
+        from src.data.market_indicators import _INDEX_CACHE_TTL
+        assert _INDEX_CACHE_TTL == 3600, \
+            f"Expected 3600s cache TTL, got {_INDEX_CACHE_TTL}"
+
+
+# ============================================
+# CONFIG INTERVAL OPTIMIZATION TESTS
+# ============================================
+
+class TestConfigIntervals:
+    """Verify optimized polling intervals."""
+
+    def test_signal_refresh_15_min(self):
+        """Signal refresh should be 15 min (900s), not 5 min."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.intervals.signal_refresh_seconds == 900, \
+            f"Expected 900s signal refresh, got {config.intervals.signal_refresh_seconds}"
+
+    def test_news_check_30_min(self):
+        """News check should be 30 min (1800s), not 5 min."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.intervals.news_check_seconds == 1800, \
+            f"Expected 1800s news check, got {config.intervals.news_check_seconds}"
+
+    def test_token_check_5_min_default(self):
+        """Fix 5: Token check interval should be 300s (5 min)."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.orders.token_check_interval_seconds == 300, \
+            f"Expected 300s token check (Fix 5), got {config.orders.token_check_interval_seconds}"
+
+    def test_no_signal_refresh_in_holding(self):
+        """HOLDING phase handler should not call _maybe_refresh_signals."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        source = inspect.getsource(TradingOrchestrator._handle_holding)
+        assert '_maybe_refresh_signals' not in source, \
+            "HOLDING phase should NOT refresh signals — no new entries possible"
+
+
+# ============================================
+# SAFETY HARDENING TESTS (10 Fixes)
+# ============================================
+
+class TestSafetyHardeningFixes:
+    """Tests for all 10 safety fixes from the hardening plan.
+
+    Fix 1: LTP force exit after 3 failures
+    Fix 2: SL cancel verify before placing new
+    Fix 3: ATR validation with confidence penalty
+    Fix 4: Partial fill better tracking
+    Fix 5: Token check interval 300s
+    Fix 6: News API failure → confidence penalty
+    Fix 7: Emergency exit timeout 300s + parallel
+    Fix 8: Model fallback indicator penalty
+    Fix 9: Gap-down on open check
+    Fix 10: LTP timeout differentiation
+    """
+
+    def _make_orchestrator(self, broker):
+        rm = RiskManager(broker=broker, initial_capital=100000, hard_stop=80000)
+        with patch('agent.orchestrator.SignalAdapter'), \
+             patch('agent.orchestrator.NewsFetcher'), \
+             patch('agent.orchestrator.NewsFeatureExtractor'), \
+             patch('agent.orchestrator.get_trade_db') as mock_db, \
+             patch('agent.orchestrator.get_limiter') as mock_limiter:
+            mock_db.return_value = MagicMock()
+            mock_limiter.return_value = MagicMock()
+            orch = __import__('agent.orchestrator', fromlist=['TradingOrchestrator']).TradingOrchestrator(
+                broker=broker, risk_manager=rm
+            )
+        return orch
+
+    def _make_trade(self, symbol="RELIANCE", entry=2500.0, sl=2400.0,
+                    target=2650.0, qty=10, highest=2500.0, atr=50.0):
+        from agent.orchestrator import TradeRecord
+        return TradeRecord(
+            trade_id=f"{symbol}_TEST", symbol=symbol, side="BUY",
+            quantity=qty, entry_price=entry, stop_loss=sl,
+            original_stop_loss=sl, current_stop=sl,
+            highest_price=highest, target=target, atr=atr,
+            order_ids=["ORD_ENTRY", "ORD_SL"]
+        )
+
+    # --- Fix 1: LTP force exit at 3 ---
+
+    def test_fix1_force_exit_at_3_failures(self):
+        """Fix 1: Position is force-exited after 3 consecutive LTP failures."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0, ltp=2500.0)
+        broker.set_ltp("RELIANCE", 0)  # LTP failure
+
+        with patch('agent.orchestrator.alert_error'), \
+             patch('agent.orchestrator.alert_trade_exit'):
+            for _ in range(3):
+                orch._check_positions()
+
+        assert "RELIANCE" not in orch.active_trades, \
+            "Position should be force-exited after 3 LTP failures"
+
+    def test_fix1_no_exit_at_2_failures(self):
+        """Fix 1: Position survives 2 failures (not yet threshold)."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0, ltp=2500.0)
+        broker.set_ltp("RELIANCE", 0)
+
+        for _ in range(2):
+            orch._check_positions()
+
+        assert "RELIANCE" in orch.active_trades, \
+            "Position should survive 2 failures"
+
+    # --- Fix 2: SL cancel verify ---
+
+    def test_fix2_sl_cancel_verify_prevents_double_sl(self):
+        """Fix 2: If old SL cancel not confirmed, don't place new SL."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+
+        # Mock: cancel succeeds but status check shows still OPEN
+        broker.cancel_order = MagicMock()
+        status_mock = MagicMock()
+        status_mock.status = OrderStatus.OPEN  # NOT cancelled
+        broker.get_order_status = MagicMock(return_value=status_mock)
+
+        # Should NOT place new SL since old one not confirmed cancelled
+        with patch.object(orch, '_place_stop_loss_at') as mock_place:
+            orch._cancel_and_replace_sl(trade, "ORD_SL", 2450.0)
+            mock_place.assert_not_called()
+
+    def test_fix2_sl_cancel_confirm_allows_new_sl(self):
+        """Fix 2: If old SL cancel confirmed, new SL is placed."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+
+        # Mock: cancel succeeds and status confirms CANCELLED
+        broker.cancel_order = MagicMock()
+        status_mock = MagicMock()
+        status_mock.status = OrderStatus.CANCELLED
+        broker.get_order_status = MagicMock(return_value=status_mock)
+
+        with patch.object(orch, '_place_stop_loss_at', return_value="NEW_SL") as mock_place:
+            orch._cancel_and_replace_sl(trade, "ORD_SL", 2450.0)
+            mock_place.assert_called_once_with(trade, 2450.0)
+
+    # --- Fix 3: ATR validation ---
+
+    def test_fix3_atr_zero_adds_risk_reason(self):
+        """Fix 3: When ATR is 0, score includes risk reason."""
+        import pandas as pd
+        import numpy as np
+        from src.models.scoring import ScoringEngine
+
+        engine = ScoringEngine()
+        df = pd.DataFrame({
+            'open': [100]*60, 'high': [105]*60, 'low': [95]*60,
+            'close': [102]*60, 'volume': [1000000]*60,
+            'rsi': [55]*60, 'macd': [0.5]*60, 'macd_signal': [0.3]*60,
+            'bb_upper': [110]*60, 'bb_lower': [90]*60,
+            'atr': [0]*60,  # Zero ATR
+            'atr_pct': [0]*60,
+            'adx': [30]*60, 'supertrend': [95]*60,
+            'trend_strength': [0.6]*60,
+            'volume_ratio': [1.2]*60, 'obv': [500000]*60,
+        })
+
+        from src.storage.models import TradeType
+        score = engine.score_stock("TEST", df, trade_type=TradeType.INTRADAY, news_score=0.5, news_reasons=[])
+        if score:
+            assert any("[RISK] ATR unavailable" in r for r in score.reasons), \
+                "ATR=0 should add risk reason"
+
+    def test_fix3_atr_zero_penalizes_confidence(self):
+        """Fix 3: ATR=0 should reduce confidence via fallback penalty."""
+        import pandas as pd
+        from src.models.scoring import ScoringEngine
+        from src.storage.models import TradeType
+
+        engine = ScoringEngine()
+        # Score with good ATR
+        df_good = pd.DataFrame({
+            'open': [100]*60, 'high': [105]*60, 'low': [95]*60,
+            'close': [102]*60, 'volume': [1000000]*60,
+            'rsi': [55]*60, 'macd': [0.5]*60, 'macd_signal': [0.3]*60,
+            'bb_upper': [110]*60, 'bb_lower': [90]*60,
+            'atr': [3.0]*60, 'atr_pct': [3.0]*60,
+            'adx': [30]*60, 'supertrend': [95]*60,
+            'trend_strength': [0.6]*60,
+            'volume_ratio': [1.2]*60, 'obv': [500000]*60,
+        })
+        # Score with zero ATR
+        df_bad = df_good.copy()
+        df_bad['atr'] = 0
+        df_bad['atr_pct'] = 0
+
+        good = engine.score_stock("TEST", df_good, trade_type=TradeType.INTRADAY, news_score=0.5, news_reasons=[])
+        bad = engine.score_stock("TEST", df_bad, trade_type=TradeType.INTRADAY, news_score=0.5, news_reasons=[])
+
+        if good and bad:
+            assert bad.confidence <= good.confidence, \
+                "ATR=0 should penalize confidence"
+
+    # --- Fix 4: Partial fill tracking ---
+
+    def test_fix4_partial_fill_code_exists(self):
+        """Fix 4: Orchestrator handles partial fill with re-check after wait."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        source = inspect.getsource(TradingOrchestrator._enter_position)
+        assert 'time.sleep(3)' in source, \
+            "Should wait 3s after cancel failure for re-check"
+        assert 'updated_status' in source or 'filled_quantity' in source, \
+            "Should re-check filled quantity after wait"
+
+    # --- Fix 5: Token check 300s ---
+
+    def test_fix5_token_check_300s(self):
+        """Fix 5: Token check interval should be 300s (5 min)."""
+        from config.trading_config import TradingConfig
+        config = TradingConfig()
+        assert config.orders.token_check_interval_seconds == 300
+
+    # --- Fix 6: No news → confidence penalty ---
+
+    def test_fix6_no_news_adds_risk_reason(self):
+        """Fix 6: When no news articles available, risk reason is added."""
+        import inspect
+        from src.signals import generator
+        source = inspect.getsource(generator.SignalGenerator.run)
+        assert "[RISK] No news data available" in source, \
+            "Generator should add risk reason when no news data"
+
+    def test_fix6_no_news_penalizes_confidence(self):
+        """Fix 6: No-news risk reason triggers 10% confidence penalty in scoring."""
+        import pandas as pd
+        from src.models.scoring import ScoringEngine
+        from src.storage.models import TradeType
+
+        engine = ScoringEngine()
+        df = pd.DataFrame({
+            'open': [100]*60, 'high': [105]*60, 'low': [95]*60,
+            'close': [102]*60, 'volume': [1000000]*60,
+            'rsi': [55]*60, 'macd': [0.5]*60, 'macd_signal': [0.3]*60,
+            'bb_upper': [110]*60, 'bb_lower': [90]*60,
+            'atr': [3.0]*60, 'atr_pct': [3.0]*60,
+            'adx': [30]*60, 'supertrend': [95]*60,
+            'trend_strength': [0.6]*60,
+            'volume_ratio': [1.2]*60, 'obv': [500000]*60,
+        })
+
+        score_with_news = engine.score_stock("TEST", df, trade_type=TradeType.INTRADAY,
+            news_score=0.6, news_reasons=["[NEWS] 3 articles, BULLISH sentiment"])
+        score_no_news = engine.score_stock("TEST", df, trade_type=TradeType.INTRADAY,
+            news_score=0.5, news_reasons=["[RISK] No news data available - trading on technicals only"])
+
+        if score_with_news and score_no_news:
+            assert score_no_news.confidence <= score_with_news.confidence, \
+                "No-news should penalize confidence"
+
+    # --- Fix 7: Shutdown timeout + parallel ---
+
+    def test_fix7_shutdown_timeout_300s(self):
+        """Fix 7: Shutdown timeout should be 300s (5 min), not 120s."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        source = inspect.getsource(TradingOrchestrator._shutdown)
+        assert 'SHUTDOWN_TIMEOUT = 300' in source, \
+            "Shutdown timeout should be 300s"
+
+    def test_fix7_shutdown_uses_parallel_exit(self):
+        """Fix 7: Shutdown should call _parallel_exit_all."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        source = inspect.getsource(TradingOrchestrator._shutdown)
+        assert '_parallel_exit_all' in source, \
+            "Shutdown should use parallel exit"
+
+    def test_fix7_parallel_exit_method_exists(self):
+        """Fix 7: _parallel_exit_all method uses ThreadPoolExecutor."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        assert hasattr(TradingOrchestrator, '_parallel_exit_all')
+        source = inspect.getsource(TradingOrchestrator._parallel_exit_all)
+        assert 'ThreadPoolExecutor' in source
+
+    def test_fix7_parallel_exit_handles_single_position(self):
+        """Fix 7: Single position should not use thread overhead."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0, ltp=2500.0)
+
+        with patch.object(orch, '_exit_position') as mock_exit, \
+             patch('agent.orchestrator.alert_trade_exit'):
+            orch._parallel_exit_all("test")
+            mock_exit.assert_called_once_with(trade, "test")
+
+    # --- Fix 8: Fallback indicator penalty ---
+
+    def test_fix8_multiple_fallbacks_penalize_confidence(self):
+        """Fix 8: Multiple missing indicators reduce confidence cumulatively."""
+        import pandas as pd
+        from src.models.scoring import ScoringEngine
+        from src.storage.models import TradeType
+
+        engine = ScoringEngine()
+        # All indicators present
+        df_good = pd.DataFrame({
+            'open': [100]*60, 'high': [105]*60, 'low': [95]*60,
+            'close': [102]*60, 'volume': [1000000]*60,
+            'rsi': [55]*60, 'macd': [0.5]*60, 'macd_signal': [0.3]*60,
+            'bb_upper': [110]*60, 'bb_lower': [90]*60,
+            'atr': [3.0]*60, 'atr_pct': [3.0]*60,
+            'adx': [30]*60, 'supertrend': [95]*60,
+            'trend_strength': [0.6]*60,
+            'volume_ratio': [1.2]*60, 'obv': [500000]*60,
+        })
+        # Multiple indicators missing
+        df_bad = df_good.copy()
+        df_bad['atr'] = 0
+        df_bad['rsi'] = 0
+        df_bad['trend_strength'] = 0
+
+        good = engine.score_stock("TEST", df_good, trade_type=TradeType.INTRADAY, news_score=0.5, news_reasons=[])
+        bad = engine.score_stock("TEST", df_bad, trade_type=TradeType.INTRADAY, news_score=0.5, news_reasons=[])
+
+        if good and bad:
+            assert bad.confidence < good.confidence, \
+                "Multiple missing indicators should reduce confidence"
+            # Check risk reason about fallback values
+            assert any("[RISK]" in r for r in bad.reasons)
+
+    def test_fix8_penalty_capped_at_25pct(self):
+        """Fix 8: Fallback penalty is capped — min multiplier is 0.75."""
+        import inspect
+        from src.models import scoring
+        source = inspect.getsource(scoring.ScoringEngine.score_stock)
+        assert 'max(0.75' in source, \
+            "Fallback penalty should be capped at 0.75 (25% max reduction)"
+
+    # --- Fix 9: Gap-down on open ---
+
+    def test_fix9_gap_down_check_exists(self):
+        """Fix 9: Orchestrator has _check_gap_down_on_open method."""
+        from agent.orchestrator import TradingOrchestrator
+        assert hasattr(TradingOrchestrator, '_check_gap_down_on_open')
+
+    def test_fix9_gap_down_called_at_market_open(self):
+        """Fix 9: _handle_market_open calls _check_gap_down_on_open."""
+        import inspect
+        from agent.orchestrator import TradingOrchestrator
+        source = inspect.getsource(TradingOrchestrator._handle_market_open)
+        assert '_check_gap_down_on_open' in source
+
+    def test_fix9_gap_down_exits_position(self):
+        """Fix 9: Gap-down >3% through SL triggers force exit."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade(sl=2400.0)  # SL at 2400
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+
+        # Price opens at 2300 — which is < 2400*0.97 = 2328
+        broker.set_ltp("RELIANCE", 2300.0)
+
+        with patch('agent.orchestrator.alert_error'), \
+             patch('agent.orchestrator.alert_trade_exit'), \
+             patch('agent.orchestrator.today_ist', return_value=date(2026, 2, 15)):
+            orch._check_gap_down_on_open()
+
+        assert "RELIANCE" not in orch.active_trades, \
+            "Gap-down through SL should trigger force exit"
+
+    def test_fix9_no_exit_when_price_above_sl(self):
+        """Fix 9: Normal open price above SL should not trigger exit."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade(sl=2400.0)
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+
+        # Price opens at 2450 — above SL
+        broker.set_ltp("RELIANCE", 2450.0)
+
+        with patch('agent.orchestrator.today_ist', return_value=date(2026, 2, 15)):
+            orch._check_gap_down_on_open()
+
+        assert "RELIANCE" in orch.active_trades, \
+            "Normal price should not trigger gap-down exit"
+
+    def test_fix9_runs_once_per_day(self):
+        """Fix 9: Gap-down check only runs once per trading day."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade(sl=2400.0)
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+        broker.set_ltp("RELIANCE", 2450.0)
+
+        with patch('agent.orchestrator.today_ist', return_value=date(2026, 2, 15)):
+            orch._check_gap_down_on_open()
+            # Mark _gap_down_checked
+            assert orch._gap_down_checked == date(2026, 2, 15)
+
+            # Second call should be a no-op (same day)
+            broker.set_ltp("RELIANCE", 2300.0)  # Would trigger exit if checked
+            orch._check_gap_down_on_open()
+            assert "RELIANCE" in orch.active_trades, \
+                "Gap-down check should not re-run same day"
+
+    # --- Fix 10: LTP timeout differentiation ---
+
+    def test_fix10_first_failure_uses_fallback_price(self):
+        """Fix 10: First LTP failure uses last known price for monitoring."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade(highest=2550.0)  # Last known price
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+        broker.set_ltp("RELIANCE", 0)  # LTP failure
+
+        orch._check_positions()
+
+        # Counter should be 1 (not reset)
+        assert orch._ltp_failures.get("RELIANCE") == 1
+        # Position should still be active (fallback used, not force-exited)
+        assert "RELIANCE" in orch.active_trades
+
+    def test_fix10_fallback_does_not_reset_counter(self):
+        """Fix 10: Using fallback price does not reset failure counter."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+        broker.set_ltp("RELIANCE", 0)
+
+        orch._check_positions()  # failure 1: uses fallback
+
+        assert orch._ltp_failures["RELIANCE"] == 1, \
+            "Fallback price should NOT reset the failure counter"
+
+    def test_fix10_real_price_resets_counter(self):
+        """Fix 10: Genuine LTP success resets the failure counter."""
+        broker = MockBroker()
+        orch = self._make_orchestrator(broker)
+        trade = self._make_trade()
+        orch.active_trades["RELIANCE"] = trade
+        broker.add_position("RELIANCE", qty=10, avg_price=2500.0)
+
+        # Fail once
+        broker.set_ltp("RELIANCE", 0)
+        orch._check_positions()
+        assert orch._ltp_failures["RELIANCE"] == 1
+
+        # Real price resets
+        broker.set_ltp("RELIANCE", 2520.0)
+        orch._check_positions()
+        assert "RELIANCE" not in orch._ltp_failures

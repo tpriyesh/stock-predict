@@ -4,7 +4,7 @@ Scrapes MoneyControl, Economic Times, Livemint, etc.
 """
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import requests
 from loguru import logger
@@ -459,7 +459,7 @@ class FirecrawlFetcher:
     def _parse_time(self, time_str: Optional[str]) -> datetime:
         """Parse time string to datetime."""
         if not time_str:
-            return datetime.utcnow()
+            return datetime.now(timezone.utc)
 
         # Try common formats
         formats = [
@@ -478,7 +478,7 @@ class FirecrawlFetcher:
 
         # If "ago" format (e.g., "2 hours ago")
         if 'ago' in time_str.lower():
-            return datetime.utcnow()
+            return datetime.now(timezone.utc)
 
         return datetime.utcnow()
 

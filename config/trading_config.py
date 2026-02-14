@@ -126,7 +126,7 @@ class TradingHours:
         default_factory=lambda: _env_time("ENTRY_WINDOW_END", "14:30")
     )
     square_off_start: time = field(
-        default_factory=lambda: _env_time("SQUARE_OFF_START", "14:30")
+        default_factory=lambda: _env_time("SQUARE_OFF_START", "15:00")
     )
     square_off_time: time = field(
         default_factory=lambda: _env_time("SQUARE_OFF_TIME", "15:00")
@@ -260,8 +260,8 @@ class OrderConfig:
         default_factory=lambda: _env_float("EXIT_RETRY_BASE_DELAY", 3.0)
     )
     token_check_interval_seconds: int = field(
-        default_factory=lambda: _env_int("TOKEN_CHECK_INTERVAL_SECONDS", 1800)
-    )
+        default_factory=lambda: _env_int("TOKEN_CHECK_INTERVAL_SECONDS", 300)
+    )  # 5 min — token expiry during open position is critical
 
 
 # ============================================
@@ -272,8 +272,8 @@ class OrderConfig:
 class IntervalConfig:
     """How often to check things."""
     signal_refresh_seconds: int = field(
-        default_factory=lambda: _env_int("SIGNAL_REFRESH_SECONDS", 300)
-    )
+        default_factory=lambda: _env_int("SIGNAL_REFRESH_SECONDS", 900)
+    )  # 15 min — news/prices don't change faster
     position_check_seconds: int = field(
         default_factory=lambda: _env_int("POSITION_CHECK_SECONDS", 60)
     )
@@ -281,8 +281,8 @@ class IntervalConfig:
         default_factory=lambda: _env_int("QUOTE_REFRESH_SECONDS", 30)
     )
     news_check_seconds: int = field(
-        default_factory=lambda: _env_int("NEWS_CHECK_SECONDS", 300)
-    )
+        default_factory=lambda: _env_int("NEWS_CHECK_SECONDS", 1800)
+    )  # 30 min — news sentiment changes slowly
 
 
 # ============================================
@@ -375,13 +375,17 @@ class ProviderConfig:
     )
     # Cache TTLs (seconds)
     news_cache_ttl: int = field(
-        default_factory=lambda: _env_int("NEWS_CACHE_TTL", 600)
-    )
+        default_factory=lambda: _env_int("NEWS_CACHE_TTL", 1800)
+    )  # 30 min — Indian financial news updates every 30-60 min
     price_cache_ttl: int = field(
         default_factory=lambda: _env_int("PRICE_CACHE_TTL", 300)
     )
     llm_cache_ttl: int = field(
-        default_factory=lambda: _env_int("LLM_CACHE_TTL", 1800)
+        default_factory=lambda: _env_int("LLM_CACHE_TTL", 21600)
+    )  # 6 hours — article content never changes
+    # Budget: max news API calls per signal generation cycle
+    news_budget_per_cycle: int = field(
+        default_factory=lambda: _env_int("NEWS_BUDGET_PER_CYCLE", 15)
     )
     # Health thresholds
     unhealthy_threshold: int = field(

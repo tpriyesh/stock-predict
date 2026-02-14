@@ -22,6 +22,8 @@ from typing import Callable, Any, Optional, Type, Tuple
 from enum import Enum
 from loguru import logger
 
+from utils.platform import now_ist
+
 
 class ErrorCategory(Enum):
     """Categories of errors for handling decisions."""
@@ -209,7 +211,7 @@ class CircuitBreaker:
         with self._lock:
             if self._state == self.State.OPEN:
                 if self._last_failure_time:
-                    elapsed = (datetime.now() - self._last_failure_time).total_seconds()
+                    elapsed = (now_ist().replace(tzinfo=None) - self._last_failure_time).total_seconds()
                     if elapsed >= self.recovery_timeout:
                         self._state = self.State.HALF_OPEN
                         self._half_open_calls = 0
@@ -233,7 +235,7 @@ class CircuitBreaker:
         """Record a failed call."""
         with self._lock:
             self._failure_count += 1
-            self._last_failure_time = datetime.now()
+            self._last_failure_time = now_ist().replace(tzinfo=None)
 
             if self._state == self.State.HALF_OPEN:
                 self._state = self.State.OPEN

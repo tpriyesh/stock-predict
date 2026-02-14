@@ -316,6 +316,17 @@ class SignalAdapter:
         if symbol in self._price_cache:
             return self._price_cache[symbol]
 
+        # Try generator's daily price cache first (avoids duplicate yfinance calls)
+        if (self._generator is not None
+                and hasattr(self._generator, '_daily_price_cache')
+                and getattr(self._generator, '_daily_price_cache_date', None) == today_ist()
+                and symbol in self._generator._daily_price_cache):
+            df = self._generator._daily_price_cache[symbol]
+            self._price_cache[symbol] = df
+            if not self._price_cache_time:
+                self._price_cache_time = now_ist().replace(tzinfo=None)
+            return df
+
         # Primary source: PriceFetcher
         df = self._fetch_from_primary(symbol)
 

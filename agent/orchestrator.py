@@ -268,6 +268,7 @@ class TradingOrchestrator:
         time.sleep(30)
 
     def _handle_market_open(self):
+        self._check_gap_down_on_open()
         self._maybe_refresh_signals()
         self._check_positions()
         time.sleep(10)
@@ -290,6 +291,7 @@ class TradingOrchestrator:
         self._verify_sl_orders()
         self._maybe_check_news()
         self._maybe_reconcile()
+        # No signal refresh during HOLDING — no new entries possible after entry window
         time.sleep(CONFIG.intervals.position_check_seconds)
 
     def _handle_square_off(self):
@@ -509,6 +511,12 @@ class TradingOrchestrator:
                 self.broker.cancel_order(response.order_id)
             except Exception as e:
                 logger.warning(f"{symbol}: Could not cancel partial order remainder: {e}")
+                # Wait and re-check — remainder might fill during cancel attempt
+                time.sleep(3)
+                updated_status = self.broker.get_order_status(response.order_id)
+                if updated_status and updated_status.filled_quantity is not None:
+                    actual_quantity = updated_status.filled_quantity
+                    logger.info(f"{symbol}: After wait, filled qty updated to {actual_quantity}")
 
             if actual_quantity <= 0:
                 logger.warning(f"{symbol}: Zero shares filled after partial, aborting entry")
@@ -648,6 +656,47 @@ class TradingOrchestrator:
             logger.warning(f"Failed to place SL for {trade.symbol}: {response.message}")
             return None
 
+    # === GAP-DOWN PROTECTION (Fix 9) ===
+
+    def _check_gap_down_on_open(self):
+        """Check held positions for gap-down through SL at market open.
+
+        If a stock opens >3% below SL, the SL-M order may execute at a much
+        worse price. Better to immediately exit at market than wait for SL-M
+        to trigger at an even worse level.
+
+        Only runs once per day (tracked via _gap_down_checked flag).
+        """
+        if not self.active_trades:
+            return
+
+        # Only check once per day
+        if hasattr(self, '_gap_down_checked') and self._gap_down_checked == today_ist():
+            return
+        self._gap_down_checked = today_ist()
+
+        for symbol, trade in list(self.active_trades.items()):
+            try:
+                self._limiter.wait("quotes")
+                ltp = self.broker.get_ltp(symbol)
+                if not ltp or ltp <= 0:
+                    continue
+
+                # Check if price opened below SL with >3% gap
+                if ltp < trade.current_stop * 0.97:
+                    logger.warning(
+                        f"{symbol}: Gap-down through SL! LTP={ltp:.2f} vs "
+                        f"SL={trade.current_stop:.2f} (gap={((trade.current_stop - ltp) / trade.current_stop * 100):.1f}%)"
+                    )
+                    alert_error(
+                        f"Gap-down through SL: {symbol}",
+                        f"Open={ltp:.2f}, SL={trade.current_stop:.2f}. "
+                        f"Exiting immediately to limit damage."
+                    )
+                    self._exit_position(trade, f"Gap-down through SL (open={ltp:.2f})")
+            except Exception as e:
+                logger.warning(f"Gap-down check failed for {symbol}: {e}")
+
     # === POSITION MONITORING ===
 
     def _check_positions(self):
@@ -671,21 +720,39 @@ class TradingOrchestrator:
             self._limiter.wait("quotes")
             current_price = self.broker.get_ltp(symbol)
 
-            # Validate price data - skip check if price is invalid
+            # Validate price data — use last known price as fallback (Fix 10)
+            _used_fallback_price = False
             if not current_price or current_price <= 0:
                 self._ltp_failures[symbol] = self._ltp_failures.get(symbol, 0) + 1
                 count = self._ltp_failures[symbol]
-                logger.warning(f"{symbol}: Invalid price {current_price} (failure #{count})")
-                if count == 5:  # Alert after 5 consecutive failures
-                    alert_error(
-                        f"LTP failures: {symbol}",
-                        f"{count} consecutive LTP fetch failures for held position {symbol}. "
-                        f"Position may be unprotected! Qty={trade.quantity}, Entry={trade.entry_price:.2f}"
-                    )
-                continue
 
-            # Reset LTP failure counter on success
-            self._ltp_failures.pop(symbol, None)
+                # On first failure, use last known price (highest_price or entry_price)
+                # to keep monitoring without counting toward force-exit threshold
+                if count == 1:
+                    fallback_price = trade.highest_price or trade.entry_price
+                    logger.warning(
+                        f"{symbol}: LTP unavailable, using last known price "
+                        f"{fallback_price:.2f} for this cycle"
+                    )
+                    current_price = fallback_price
+                    _used_fallback_price = True
+                    # Don't continue — use fallback price for SL/target checks below
+                else:
+                    logger.warning(f"{symbol}: LTP failure #{count}")
+                    if count >= 3:
+                        # Force exit — unmonitored position is more dangerous than exiting blind
+                        alert_error(
+                            f"LTP failure cascade: {symbol}",
+                            f"{count} consecutive LTP failures. Force-exiting position. "
+                            f"Qty={trade.quantity}, Entry={trade.entry_price:.2f}"
+                        )
+                        self._exit_position(trade, f"LTP failure cascade ({count} failures)")
+                        break  # Position removed from active_trades, skip rest
+                    continue
+
+            # Reset LTP failure counter on genuine success (not fallback)
+            if not _used_fallback_price:
+                self._ltp_failures.pop(symbol, None)
 
             # Sanity check: reject absurd price moves (>20% from entry = likely data error)
             price_change_pct = abs(current_price - trade.entry_price) / trade.entry_price
@@ -890,13 +957,29 @@ class TradingOrchestrator:
                 alert_error("SL update completely failed", f"{trade.symbol}: Position may be unprotected")
 
     def _cancel_and_replace_sl(self, trade: TradeRecord, old_order_id: str, new_stop: float):
-        """Cancel existing SL and place a new one."""
+        """Cancel existing SL and place a new one.
+
+        Safety: Only places new SL if old SL is confirmed cancelled.
+        This prevents two live SL orders (double-sell risk).
+        """
         try:
             self._limiter.wait("orders")
             self.broker.cancel_order(old_order_id)
             self._db.update_order_status(old_order_id, "CANCELLED")
-        except Exception:
-            pass  # May already be cancelled/filled
+
+            # Verify cancellation — don't trust fire-and-forget
+            status = self.broker.get_order_status(old_order_id)
+            if status and status.status not in (
+                OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.COMPLETE
+            ):
+                logger.warning(
+                    f"{trade.symbol}: Old SL {old_order_id} not confirmed cancelled "
+                    f"(status={status.status}), keeping old SL to prevent double-sell"
+                )
+                return
+        except Exception as e:
+            logger.warning(f"{trade.symbol}: Cancel SL failed: {e}, keeping old SL")
+            return  # Don't place new SL if old one might still be active
 
         new_sl_id = self._place_stop_loss_at(trade, new_stop)
         if new_sl_id:
@@ -1148,10 +1231,41 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"Failed to exit {symbol}: {e}")
 
+    def _parallel_exit_all(self, reason: str):
+        """Exit all positions in parallel using ThreadPoolExecutor (Fix 7).
+
+        Each individual exit has its own retry logic (up to ~45s),
+        but running them in parallel means 5 positions take ~45s total
+        instead of ~225s sequentially.
+        """
+        trades_to_exit = list(self.active_trades.values())
+        if not trades_to_exit:
+            return
+
+        if len(trades_to_exit) == 1:
+            # Single position — no need for thread overhead
+            self._exit_position(trades_to_exit[0], reason)
+            return
+
+        logger.info(f"Parallel exit: {len(trades_to_exit)} positions")
+        max_workers = min(3, len(trades_to_exit))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self._exit_position, trade, reason): trade
+                for trade in trades_to_exit
+            }
+            for future in futures:
+                try:
+                    future.result(timeout=60)  # 60s per individual exit
+                except Exception as e:
+                    trade = futures[future]
+                    logger.error(f"Parallel exit failed for {trade.symbol}: {e}")
+
     def _emergency_exit_all(self, reason: str):
         logger.warning(f"EMERGENCY EXIT: {reason}")
         alert_error("Emergency exit", reason)
-        self._exit_all_positions(f"EMERGENCY: {reason}")
+        self._parallel_exit_all(f"EMERGENCY: {reason}")
 
     # === RECONCILIATION ===
 
@@ -1471,29 +1585,31 @@ class TradingOrchestrator:
 
     def _shutdown(self):
         logger.info("Shutting down orchestrator...")
+        SHUTDOWN_TIMEOUT = 300  # 5 min for all exits (Fix 7)
+
         # Always try to exit if positions exist (even if market appears closed)
         if self.active_trades:
-            logger.warning("Positions still open during shutdown!")
+            logger.warning(f"Positions still open during shutdown: {list(self.active_trades.keys())}")
             # Use timeout to prevent hanging on unresponsive broker
             import threading
             exit_done = threading.Event()
 
             def _exit_with_timeout():
                 try:
-                    self._exit_all_positions("Agent shutdown")
+                    self._parallel_exit_all("Agent shutdown")
                 finally:
                     exit_done.set()
 
             t = threading.Thread(target=_exit_with_timeout, daemon=True)
             t.start()
-            if not exit_done.wait(timeout=120):
+            if not exit_done.wait(timeout=SHUTDOWN_TIMEOUT):
                 logger.critical(
-                    "SHUTDOWN TIMEOUT: Could not exit all positions within 120s. "
+                    f"SHUTDOWN TIMEOUT: Could not exit all positions within {SHUTDOWN_TIMEOUT}s. "
                     f"Stuck positions: {list(self.active_trades.keys())}"
                 )
                 alert_error(
                     "SHUTDOWN TIMEOUT",
-                    f"Could not exit positions within 120s. "
+                    f"Could not exit positions within {SHUTDOWN_TIMEOUT}s. "
                     f"Manual intervention needed: {list(self.active_trades.keys())}"
                 )
         self._generate_daily_report()

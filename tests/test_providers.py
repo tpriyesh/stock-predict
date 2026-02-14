@@ -723,7 +723,9 @@ class TestProviderConfig:
         assert config.gnews_daily_limit == 100
         assert config.openai_rpm == 180
         assert config.openai_daily_cost_cap == 5.0
-        assert config.news_cache_ttl == 600
+        assert config.news_cache_ttl == 1800       # 30 min (optimized)
+        assert config.llm_cache_ttl == 21600        # 6 hours (optimized)
+        assert config.news_budget_per_cycle == 15   # budget-aware fetching
         assert config.quota_alert_pct == 0.80
 
     def test_provider_config_in_master(self):
