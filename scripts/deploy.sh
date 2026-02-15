@@ -74,6 +74,10 @@ if [ -n "$(git status --porcelain)" ]; then
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         read -p "Commit message: " MSG
         git add -A
+        # Safety: verify no secrets staged
+        if git diff --cached --name-only | grep -qE '\.env$|credentials|secret'; then
+            fail "Sensitive file detected in staged changes — review before committing"
+        fi
         git commit -m "$MSG"
     else
         fail "Commit or stash changes before deploying"
@@ -133,6 +137,12 @@ if [ "$LOCAL_COMMIT" != "$VPS_COMMIT" ]; then
     fail "Commit mismatch! Local=$LOCAL_COMMIT VPS=$VPS_COMMIT"
 fi
 log "VPS at commit: $VPS_COMMIT (matches local)"
+
+# Verify .env exists on VPS (container won't work without it)
+if ! ssh "$VPS_HOST" "test -f $PROJECT_DIR/.env"; then
+    fail ".env file missing on VPS! Copy it first: scp .env $VPS_HOST:$PROJECT_DIR/.env"
+fi
+log ".env exists on VPS"
 
 # ============================================================
 # STEP 4: Build Docker image on VPS

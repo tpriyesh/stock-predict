@@ -71,7 +71,7 @@ class UpstoxBroker(BaseBroker):
         self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
 
         # Token storage path
-        self._token_path = Path.home() / ".upstox_token.json"
+        self._token_path = Path(__file__).parent.parent / "data" / "upstox_token.json"
 
         # NSE holidays (update annually)
         self._holidays = self._load_holidays()

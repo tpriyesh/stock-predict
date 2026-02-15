@@ -364,10 +364,14 @@ def run_trading_session(live: bool, broker_type: str = "paper"):
         print("=" * 60)
         print("  WARNING: LIVE TRADING - REAL MONEY AT RISK")
         print("=" * 60)
-        confirm = input("\nType 'I CONFIRM' to start live trading: ")
-        if confirm != "I CONFIRM":
-            print("Cancelled.")
-            return
+        # In Docker/CI, TRADING_MODE=live bypasses the interactive prompt
+        if os.getenv("TRADING_MODE", "").lower() == "live":
+            print("TRADING_MODE=live detected — skipping confirmation prompt.")
+        else:
+            confirm = input("\nType 'I CONFIRM' to start live trading: ")
+            if confirm != "I CONFIRM":
+                print("Cancelled.")
+                return
         print()
 
     print("Starting trading session...")

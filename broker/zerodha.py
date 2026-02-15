@@ -96,7 +96,7 @@ class ZerodhaBroker(BaseBroker):
 
     def _load_token_from_file(self) -> str:
         """Load access token from saved file."""
-        token_path = Path.home() / ".zerodha_token.json"
+        token_path = Path(__file__).parent.parent / "data" / "zerodha_token.json"
         try:
             if token_path.exists():
                 data = json.loads(token_path.read_text())

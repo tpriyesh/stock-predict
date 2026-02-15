@@ -40,7 +40,7 @@ TWOFA_URL = "https://kite.zerodha.com/api/twofa"
 CONNECT_URL = "https://kite.trade/connect/login"
 
 # Token save path
-TOKEN_PATH = Path.home() / ".zerodha_token.json"
+TOKEN_PATH = Path(__file__).parent.parent / "data" / "zerodha_token.json"
 
 # Retry config
 MAX_RETRIES = 3
