@@ -160,14 +160,18 @@ def perform_login() -> str:
         raise Exception(f"2FA failed: HTTP {resp.status_code}")
 
     # Step 3: Get request token from OAuth redirect
+    # Follow redirects manually — stop before hitting localhost (which won't be running)
     print("  Step 3: Getting request token...")
-    resp = session.get(
-        f"{CONNECT_URL}?api_key={api_key}&v=3",
-        timeout=30,
-        allow_redirects=True
-    )
+    redirect_url = f"{CONNECT_URL}?api_key={api_key}&v=3"
 
-    redirect_url = resp.url
+    for _ in range(10):  # max 10 hops
+        resp = session.get(redirect_url, timeout=30, allow_redirects=False)
+        if resp.status_code not in (301, 302):
+            break
+        redirect_url = resp.headers.get("Location", "")
+        if "request_token=" in redirect_url:
+            break  # Found it — don't follow further (next hop is localhost)
+
     if "request_token=" not in redirect_url:
         raise Exception(f"No request_token in redirect URL: {redirect_url}")
 
