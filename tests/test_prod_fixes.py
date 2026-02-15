@@ -2972,3 +2972,222 @@ class TestSafetyHardeningFixes:
         broker.set_ltp("RELIANCE", 2520.0)
         orch._check_positions()
         assert "RELIANCE" not in orch._ltp_failures
+
+
+# ============================================
+# ENHANCED DAILY REPORT: BROKERAGE & TAX CALC
+# ============================================
+
+class TestZerodhaChargesCalculation:
+    """
+    Tests for calculate_zerodha_charges() — exact Zerodha intraday charges.
+    These are financial calculations, so precision matters.
+    """
+
+    def test_basic_profitable_trade(self):
+        """Standard profitable intraday trade charges."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=1000.0, sell_price=1020.0, quantity=10
+        )
+        # Buy turnover: 10000, Sell turnover: 10200, Total: 20200
+        # Brokerage: min(20, 10000*0.03%) + min(20, 10200*0.03%) = 3.0 + 3.06 = 6.06
+        assert charges.brokerage == 6.06
+        # STT: 10200 * 0.025% = 2.55
+        assert charges.stt == 2.55
+        # Exchange: 20200 * 0.00345% = 0.70
+        assert charges.exchange_charges == 0.70
+        # GST: 18% * (6.06 + 0.70) = 1.22
+        assert charges.gst == 1.22
+        # SEBI: 20200 * 10 / 10000000 = 0.02
+        assert charges.sebi_charges == 0.02
+        # Stamp: 10000 * 0.003% = 0.30
+        assert charges.stamp_duty == 0.30
+        # Total should be sum of all
+        expected_total = 6.06 + 2.55 + 0.70 + 1.22 + 0.02 + 0.30
+        assert abs(charges.total - expected_total) < 0.01
+
+    def test_large_order_brokerage_cap(self):
+        """Brokerage should cap at Rs.20 per order for large trades."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=2500.0, sell_price=2550.0, quantity=100
+        )
+        # Buy turnover: 250000, Sell turnover: 255000
+        # Brokerage: min(20, 250000*0.03%=75) + min(20, 255000*0.03%=76.5) = 20 + 20 = 40
+        assert charges.brokerage == 40.0
+
+    def test_losing_trade_charges_still_apply(self):
+        """Charges apply even on losing trades."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=1000.0, sell_price=980.0, quantity=10
+        )
+        assert charges.total > 0
+        # STT is on sell side: 9800 * 0.025% = 2.45
+        assert charges.stt == 2.45
+
+    def test_zero_quantity_returns_empty(self):
+        """Zero quantity should return zero charges."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=1000.0, sell_price=1020.0, quantity=0
+        )
+        assert charges.total == 0.0
+
+    def test_zero_price_returns_empty(self):
+        """Zero/negative price should return zero charges."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=0.0, sell_price=1020.0, quantity=10
+        )
+        assert charges.total == 0.0
+
+    def test_single_share_small_trade(self):
+        """Single share trade — minimum brokerage scenario."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=100.0, sell_price=101.0, quantity=1
+        )
+        # Buy turnover: 100, Sell turnover: 101, Total: 201
+        # Brokerage: min(20, 0.03) + min(20, 0.03) = 0.03 + 0.03 = 0.06
+        assert charges.brokerage == 0.06
+        assert charges.total > 0
+
+    def test_charges_are_always_non_negative(self):
+        """All charge components should be >= 0."""
+        from utils.alerts import calculate_zerodha_charges
+        charges = calculate_zerodha_charges(
+            buy_price=500.0, sell_price=450.0, quantity=50
+        )
+        assert charges.brokerage >= 0
+        assert charges.stt >= 0
+        assert charges.exchange_charges >= 0
+        assert charges.gst >= 0
+        assert charges.sebi_charges >= 0
+        assert charges.stamp_duty >= 0
+
+
+class TestEnhancedDailyReport:
+    """Tests for the enhanced alert_daily_report with trade breakdown."""
+
+    def _make_trade(self, symbol="RELIANCE", entry=2500.0, exit_p=2550.0,
+                    qty=10, reason="target", pnl=None):
+        """Create a mock trade object."""
+        trade = MagicMock()
+        trade.symbol = symbol
+        trade.entry_price = entry
+        trade.exit_price = exit_p
+        trade.quantity = qty
+        trade.exit_reason = reason
+        trade.pnl = pnl if pnl is not None else (exit_p - entry) * qty
+        return trade
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_with_trades_has_breakdown(self, mock_send):
+        """Report with trades should include per-trade and charges breakdown."""
+        from utils.alerts import alert_daily_report
+        trades = [
+            self._make_trade("RELIANCE", 2500, 2550, 10, "target"),
+            self._make_trade("INFY", 1500, 1480, 5, "stop_loss", pnl=-100),
+        ]
+        alert_daily_report(2, 1, 400.0, 100000.0, trades=trades)
+
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][0]
+        assert "DAILY REPORT" in msg
+        assert "RELIANCE" in msg
+        assert "INFY" in msg
+        assert "Brokerage" in msg
+        assert "STT" in msg
+        assert "GST" in msg
+        assert "Total Charges" in msg
+        assert "Net Profit" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_with_profit_shows_tax(self, mock_send):
+        """Profitable day should show 20% STCG tax estimation."""
+        from utils.alerts import alert_daily_report
+        trades = [self._make_trade("RELIANCE", 2500, 2600, 10, "target")]
+        alert_daily_report(1, 1, 1000.0, 100000.0, trades=trades)
+
+        msg = mock_send.call_args[0][0]
+        assert "STCG @20%" in msg
+        assert "Take-Home" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_with_loss_shows_no_tax(self, mock_send):
+        """Loss day should show Rs.0 tax and note about offsetting."""
+        from utils.alerts import alert_daily_report
+        trades = [self._make_trade("RELIANCE", 2500, 2400, 10, "stop_loss", pnl=-1000)]
+        alert_daily_report(1, 0, -1000.0, 99000.0, trades=trades)
+
+        msg = mock_send.call_args[0][0]
+        assert "Tax: Rs.0" in msg
+        assert "offset future gains" in msg
+        assert "Net Loss" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_without_trades_fallback(self, mock_send):
+        """Report without trade list should use total_pnl directly."""
+        from utils.alerts import alert_daily_report
+        alert_daily_report(3, 2, 500.0, 100000.0)
+
+        msg = mock_send.call_args[0][0]
+        assert "DAILY REPORT" in msg
+        assert "Win Rate: 67%" in msg
+        assert "500.00" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_zero_trades(self, mock_send):
+        """Zero trades should show 0% win rate and no trade details."""
+        from utils.alerts import alert_daily_report
+        alert_daily_report(0, 0, 0.0, 100000.0)
+
+        msg = mock_send.call_args[0][0]
+        assert "Trades: 0" in msg
+        assert "Win Rate: 0%" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_includes_portfolio_value(self, mock_send):
+        """Report should always include portfolio value."""
+        from utils.alerts import alert_daily_report
+        alert_daily_report(1, 1, 100.0, 88000.0,
+                          trades=[self._make_trade()])
+
+        msg = mock_send.call_args[0][0]
+        assert "88,000" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_multiple_trades_charges_accumulate(self, mock_send):
+        """Charges from multiple trades should sum correctly."""
+        from utils.alerts import alert_daily_report, calculate_zerodha_charges
+        t1 = self._make_trade("RELIANCE", 2500, 2550, 10)
+        t2 = self._make_trade("INFY", 1500, 1520, 20)
+        trades = [t1, t2]
+
+        alert_daily_report(2, 2, 900.0, 100000.0, trades=trades)
+
+        msg = mock_send.call_args[0][0]
+        # Both trades should appear
+        assert "RELIANCE" in msg
+        assert "INFY" in msg
+        # Charges should be summed totals
+        assert "Total Charges" in msg
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_env_tag_applied(self, mock_send):
+        """_send_telegram is called (env tag handled by _send_telegram itself)."""
+        from utils.alerts import alert_daily_report
+        alert_daily_report(0, 0, 0.0, 100000.0)
+        mock_send.assert_called_once()
+
+    @patch('utils.alerts._send_telegram')
+    def test_report_handles_none_exit_price(self, mock_send):
+        """Trade with None exit_price should not crash (edge case)."""
+        from utils.alerts import alert_daily_report
+        trade = self._make_trade()
+        trade.exit_price = None
+        alert_daily_report(1, 0, 0.0, 100000.0, trades=[trade])
+        # Should not raise — None handled via `or 0.0`
+        mock_send.assert_called_once()

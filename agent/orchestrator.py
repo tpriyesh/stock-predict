@@ -1422,6 +1422,10 @@ class TradingOrchestrator:
     def _generate_daily_report(self):
         if not self.completed_trades:
             logger.info("No trades today")
+            try:
+                alert_daily_report(0, 0, 0.0, self.risk_manager.get_portfolio_value())
+            except Exception:
+                pass
             return
 
         total_pnl = sum(t.pnl for t in self.completed_trades)
@@ -1459,11 +1463,12 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to save daily summary: {e}")
 
-        # Send Telegram alert
+        # Send Telegram alert with full trade details
         try:
             alert_daily_report(
                 len(self.completed_trades), len(winners),
-                total_pnl, self.risk_manager.get_portfolio_value()
+                total_pnl, self.risk_manager.get_portfolio_value(),
+                trades=self.completed_trades
             )
         except Exception:
             pass
