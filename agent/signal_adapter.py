@@ -54,6 +54,9 @@ class TradeSignal:
     atr_pct: float
     position_size_pct: float
 
+    # Liquidity
+    avg_daily_volume: int = 0
+
     # Context
     reasons: List[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: now_ist().replace(tzinfo=None))
@@ -175,6 +178,9 @@ class SignalAdapter:
             if entry and stop and target and entry != stop:
                 risk = abs(entry - stop)
                 reward = abs(target - entry)
+                # Deduct estimated round-trip fees from reward
+                estimated_fees = entry * CONFIG.capital.estimated_fee_pct * 2
+                reward = max(0, reward - estimated_fees)
                 rr_ratio = reward / risk if risk > 0 else 0
             else:
                 rr_ratio = 0
@@ -228,8 +234,8 @@ class SignalAdapter:
             if signal.target_price <= signal.entry_price:
                 return False
 
-        # Volume/liquidity check
-        if not self._passes_volume_check(signal.symbol):
+        # Volume/liquidity check (also populates signal.avg_daily_volume)
+        if not self._passes_volume_check(signal.symbol, signal=signal):
             logger.info(f"{signal.symbol}: REJECTED by volume filter (illiquid)")
             return False
 
@@ -242,10 +248,22 @@ class SignalAdapter:
         st_direction, adx_ok = self._check_trend_filters(signal.symbol)
 
         # Supertrend: BUY requires uptrend (1), SELL requires downtrend (-1)
+        # Exception: mean-reversion BUY allowed when RSI is oversold (< rsi_oversold)
         if signal.decision == TradeDecision.BUY and st_direction != 1:
-            logger.info(f"{signal.symbol}: REJECTED by Supertrend (downtrend, need uptrend for BUY)")
-            signal.reasons.append("[FILTER] Rejected: Supertrend in downtrend")
-            return False
+            rsi = self._get_rsi(signal.symbol)
+            if rsi is not None and rsi < CONFIG.strategy.rsi_oversold:
+                logger.info(
+                    f"{signal.symbol}: Supertrend downtrend but RSI={rsi:.1f} (oversold) - "
+                    f"allowing mean-reversion BUY with reduced confidence"
+                )
+                signal.confidence *= 0.85
+                signal.reasons.append(
+                    f"[FILTER] Mean-reversion: RSI={rsi:.1f} oversold, confidence reduced 0.85x"
+                )
+            else:
+                logger.info(f"{signal.symbol}: REJECTED by Supertrend (downtrend, need uptrend for BUY)")
+                signal.reasons.append("[FILTER] Rejected: Supertrend in downtrend")
+                return False
         elif signal.decision == TradeDecision.SELL and st_direction != -1:
             logger.info(f"{signal.symbol}: REJECTED by Supertrend (uptrend, need downtrend for SELL)")
             signal.reasons.append("[FILTER] Rejected: Supertrend in uptrend")
@@ -299,6 +317,20 @@ class SignalAdapter:
         except Exception as e:
             logger.warning(f"Trend filter check failed for {symbol}: {e}")
             return 0, False  # Reject on error (conservative)
+
+    def _get_rsi(self, symbol: str) -> Optional[float]:
+        """Get current RSI for a symbol (for mean-reversion check)."""
+        try:
+            df = self._get_price_data(symbol)
+            if df is None or len(df) < 20:
+                return None
+            if 'rsi' not in df.columns:
+                df = TechnicalIndicators.calculate_all(df)
+            rsi_val = df['rsi'].iloc[-1]
+            return float(rsi_val) if pd.notna(rsi_val) else None
+        except Exception as e:
+            logger.debug(f"RSI check failed for {symbol}: {e}")
+            return None
 
     def _get_price_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Get price data for a symbol, using cache (expires after signal_cache_minutes).
@@ -409,7 +441,7 @@ class SignalAdapter:
         position = base * confidence_mult * rr_mult
         return min(position, CONFIG.capital.max_position_pct)
 
-    def _passes_volume_check(self, symbol: str) -> bool:
+    def _passes_volume_check(self, symbol: str, signal: 'TradeSignal' = None) -> bool:
         """Check if stock has adequate daily volume for safe entry/exit."""
         min_volume_cr = CONFIG.signals.min_volume_cr
         try:
@@ -429,6 +461,9 @@ class SignalAdapter:
                     f"min ₹{min_volume_cr:.0f}Cr"
                 )
                 return False
+            # Populate avg volume on signal for downstream liquidity cap
+            if signal is not None:
+                signal.avg_daily_volume = int(avg_volume)
             return True
         except Exception as e:
             logger.debug(f"Volume check failed for {symbol}: {e}")

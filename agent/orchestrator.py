@@ -42,6 +42,7 @@ from utils.alerts import (
 from src.execution.trailing_stop import TrailingStopCalculator, TrailingStopConfig, TrailingMethod
 from src.data.news_fetcher import NewsFetcher
 from src.features.news_features import NewsFeatureExtractor
+from src.features.market_features import MarketFeatures
 
 
 class TradingPhase(Enum):
@@ -140,6 +141,9 @@ class TradingOrchestrator:
         # News monitoring for held positions
         self._news_fetcher = NewsFetcher()
         self._news_extractor = NewsFeatureExtractor()
+
+        # Market features for sector mapping
+        self._market_features = MarketFeatures()
 
         # Persistence
         self._db = get_trade_db()
@@ -260,6 +264,11 @@ class TradingOrchestrator:
         else:
             return TradingPhase.SQUARE_OFF
 
+    def _is_friday_afternoon(self) -> bool:
+        """Block new entries after 13:00 IST on Fridays (weekend gap risk)."""
+        now = now_ist().replace(tzinfo=None)
+        return now.weekday() == 4 and time_ist() >= dt_time(13, 0)
+
     # === PHASE HANDLERS ===
 
     def _handle_pre_market(self):
@@ -277,7 +286,9 @@ class TradingOrchestrator:
         self._maybe_check_token()
         self._maybe_refresh_signals()
 
-        if len(self.active_trades) < CONFIG.capital.max_positions:
+        if self._is_friday_afternoon():
+            logger.info("Friday afternoon: blocking new entries (weekend gap risk)")
+        elif len(self.active_trades) < CONFIG.capital.max_positions:
             self._try_enter_positions()
 
         self._check_positions()
@@ -385,6 +396,14 @@ class TradingOrchestrator:
         if available_slots <= 0 or not self.pending_signals:
             return
 
+        # Max daily trades limit
+        if self.risk_manager.trades_today >= CONFIG.signals.max_daily_trades:
+            logger.warning(
+                f"Daily trade limit reached ({self.risk_manager.trades_today}/"
+                f"{CONFIG.signals.max_daily_trades})"
+            )
+            return
+
         # Circuit breaker: pause entries after 5 consecutive ORDER failures
         # (signal rejections don't count - only actual broker/order failures)
         if self._consecutive_order_failures >= 5:
@@ -427,11 +446,27 @@ class TradingOrchestrator:
             symbol=symbol,
             entry_price=signal.current_price,
             stop_loss=signal.stop_loss,
-            direction='BUY'
+            direction='BUY',
+            atr_pct=getattr(signal, 'atr_pct', 0.0) or 0.0,
+            avg_daily_volume=getattr(signal, 'avg_daily_volume', 0) or 0
         )
         if not risk_check.allowed:
             logger.warning(f"Risk manager rejected {symbol}: {risk_check.reason}")
             return None  # Signal rejection — don't count toward circuit breaker
+
+        # Sector concentration check
+        sector = self._market_features.get_symbol_sector(symbol)
+        if sector != 'Unknown':
+            sector_count = sum(
+                1 for s in self.active_trades
+                if self._market_features.get_symbol_sector(s) == sector
+            )
+            if sector_count >= CONFIG.capital.max_per_sector:
+                logger.warning(
+                    f"{symbol}: Sector limit reached ({sector}: "
+                    f"{sector_count}/{CONFIG.capital.max_per_sector})"
+                )
+                return None  # Signal rejection
 
         # Use the SMALLER of: risk manager's max quantity vs signal's suggested size
         funds = self.broker.get_funds()
@@ -891,8 +926,14 @@ class TradingOrchestrator:
                 summary = self._news_extractor.get_symbol_news_summary(articles, symbol)
                 avg_sentiment = summary.get('avg_sentiment', 0)
 
-                # Negative sentiment: tighten stop to breakeven or closer
-                if avg_sentiment < -0.3 and len(articles) >= 2:
+                # Negative sentiment: strongest condition first
+                if avg_sentiment < -0.5:
+                    # Very negative sentiment with even 1 article - exit immediately
+                    logger.warning(
+                        f"{symbol} STRONGLY NEGATIVE NEWS (sentiment={avg_sentiment:.2f}) -> exiting"
+                    )
+                    self._exit_position(trade, f"Negative news (sentiment={avg_sentiment:.2f})")
+                elif avg_sentiment < -0.3 and len(articles) >= 2:
                     breakeven_stop = trade.entry_price
                     if breakeven_stop > trade.current_stop:
                         old_stop = trade.current_stop
@@ -905,12 +946,6 @@ class TradingOrchestrator:
                         )
                         self._db.update_stop(trade.trade_id, breakeven_stop, trade.highest_price)
                         self._update_broker_stop(trade, breakeven_stop)
-                elif avg_sentiment < -0.5:
-                    # Very negative sentiment with even 1 article - exit immediately
-                    logger.warning(
-                        f"{symbol} STRONGLY NEGATIVE NEWS (sentiment={avg_sentiment:.2f}) -> exiting"
-                    )
-                    self._exit_position(trade, f"Negative news (sentiment={avg_sentiment:.2f})")
 
             except Exception as e:
                 logger.warning(f"News check failed for {symbol}: {e}")

@@ -159,6 +159,7 @@ class MarketIndicators:
             'vix_level': None,
             'vix_regime': 'NORMAL',
             'nifty_trend': 'SIDEWAYS',
+            'vix_trend': 'STABLE',
             'sector_leaders': [],
             'sector_laggards': [],
         }
@@ -173,6 +174,19 @@ class MarketIndicators:
                 regime['vix_regime'] = 'HIGH_FEAR'  # Fear
             else:
                 regime['vix_regime'] = 'NORMAL'
+
+        # VIX trend direction (compare to 5-day SMA)
+        vix_df = self.get_vix("1mo")
+        if not vix_df.empty and len(vix_df) >= 5:
+            vix_current = vix_df['close'].iloc[-1]
+            vix_sma5 = vix_df['close'].tail(5).mean()
+            pct_diff = (vix_current - vix_sma5) / vix_sma5
+            if pct_diff > 0.05:
+                regime['vix_trend'] = 'RISING'
+            elif pct_diff < -0.05:
+                regime['vix_trend'] = 'FALLING'
+            else:
+                regime['vix_trend'] = 'STABLE'
 
         # Get NIFTY trend
         nifty = self.get_index_data('NIFTY50', '3mo')
@@ -195,11 +209,17 @@ class MarketIndicators:
             regime['sector_leaders'] = [s[0] for s in sorted_sectors[:3]]
             regime['sector_laggards'] = [s[0] for s in sorted_sectors[-3:]]
 
-        # Overall regime
+        # Overall regime — explicit handling of mixed signals
         if regime['vix_regime'] == 'LOW_FEAR' and regime['nifty_trend'] == 'BULLISH':
             regime['overall'] = 'RISK_ON'
-        elif regime['vix_regime'] == 'HIGH_FEAR' or regime['nifty_trend'] == 'BEARISH':
+        elif regime['vix_regime'] == 'HIGH_FEAR' and regime['nifty_trend'] == 'BEARISH':
             regime['overall'] = 'RISK_OFF'
+        elif regime['vix_regime'] == 'HIGH_FEAR' and regime['nifty_trend'] in ('BULLISH', 'SIDEWAYS'):
+            regime['overall'] = 'CAUTIOUS'  # Mixed: high fear but not bearish
+        elif regime['vix_regime'] == 'LOW_FEAR' and regime['nifty_trend'] == 'BEARISH':
+            regime['overall'] = 'CAUTIOUS'  # Mixed: low fear but bearish
+        elif regime['nifty_trend'] == 'BEARISH':
+            regime['overall'] = 'RISK_OFF'  # Bearish without VIX data
         else:
             regime['overall'] = 'NEUTRAL'
 

@@ -168,7 +168,8 @@ Example output:
                 sentiment=Sentiment(result.get('sentiment', 'neutral')),
                 sentiment_score=max(-1.0, min(1.0, float(result.get('sentiment_score', 0.0)))),
                 key_claims=result.get('key_claims', []),
-                relevance_score=max(0.0, min(1.0, float(result.get('relevance_score', 0.5))))
+                relevance_score=max(0.0, min(1.0, float(result.get('relevance_score', 0.5)))),
+                risk_flags=result.get('risk_flags', [])
             )
 
             # Cache the extracted result
@@ -258,7 +259,22 @@ Example output:
                 'recent_claims': []
             }
 
-        # Time-decayed weighted average sentiment
+        # Event-type weights: high-impact events get more weight
+        EVENT_TYPE_WEIGHTS = {
+            'earnings': 1.3, 'order_win': 1.2, 'guidance': 1.2,
+            'regulatory': 1.1, 'mna': 1.1,
+            'dividend': 1.0, 'split': 1.0,
+            'macro': 0.9, 'other': 0.8,
+        }
+
+        # Source credibility weights
+        SOURCE_CREDIBILITY = {
+            'reuters': 1.3, 'bloomberg': 1.3, 'economic times': 1.2,
+            'moneycontrol': 1.2, 'livemint': 1.1, 'business standard': 1.1,
+            'ndtv profit': 1.1, 'cnbc': 1.1, 'financial express': 1.0,
+        }
+
+        # Time-decayed weighted average sentiment with event/source/risk weighting
         from utils.platform import now_ist
         import pytz
         now = now_ist()
@@ -269,10 +285,40 @@ Example output:
             if pub_time.tzinfo is None:
                 pub_time = pytz.utc.localize(pub_time)
             hours_old = max(0, (now - pub_time).total_seconds() / 3600)
-            weight = max(0.1, 1.0 - (hours_old / 72.0))
-            weighted_sentiment += a.sentiment_score * weight
-            total_weight += weight
+            time_weight = max(0.1, 1.0 - (hours_old / 72.0))
+
+            sentiment = a.sentiment_score
+            # Penalize articles with risk flags (rumor, unconfirmed, etc.)
+            if a.risk_flags:
+                sentiment *= 0.7
+
+            # Event-type weight
+            event_weight = EVENT_TYPE_WEIGHTS.get(a.event_type.value, 0.8)
+
+            # Source credibility weight
+            source_lower = (a.source or '').lower()
+            source_weight = 1.0
+            for known_source, cred in SOURCE_CREDIBILITY.items():
+                if known_source in source_lower:
+                    source_weight = cred
+                    break
+
+            combined_weight = time_weight * event_weight * source_weight
+            weighted_sentiment += sentiment * combined_weight
+            total_weight += combined_weight
+
         avg_sentiment = weighted_sentiment / total_weight if total_weight > 0 else 0.0
+
+        # Conflicting sentiment detection
+        sentiment_conflict = False
+        sentiment_std_dev = 0.0
+        if len(relevant) >= 2:
+            import statistics
+            scores = [a.sentiment_score for a in relevant]
+            sentiment_std_dev = statistics.stdev(scores)
+            if sentiment_std_dev > 0.4:
+                avg_sentiment *= 0.8
+                sentiment_conflict = True
 
         # Determine sentiment trend
         if avg_sentiment > 0.3:
@@ -297,6 +343,8 @@ Example output:
             'article_count': len(relevant),
             'avg_sentiment': round(avg_sentiment, 3),
             'sentiment_trend': sentiment_trend,
+            'sentiment_conflict': sentiment_conflict,
+            'sentiment_std_dev': round(sentiment_std_dev, 3),
             'event_types': event_types,
             'recent_claims': recent_claims[:5],
             'latest_article': relevant[0].title if relevant else None,

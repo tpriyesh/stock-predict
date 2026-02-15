@@ -92,6 +92,7 @@ class NewsArticle(BaseModel):
     sentiment_score: float = Field(default=0.0, ge=-1.0, le=1.0)
     key_claims: list[str] = Field(default_factory=list)
     relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    risk_flags: list[str] = Field(default_factory=list)
 
     class Config:
         frozen = True

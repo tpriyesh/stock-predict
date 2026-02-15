@@ -101,6 +101,9 @@ class CapitalConfig:
     max_completed_trades_in_memory: int = field(
         default_factory=lambda: _env_int("MAX_COMPLETED_TRADES_IN_MEMORY", 200)
     )  # Cap in-memory list, rest in DB
+    max_per_sector: int = field(
+        default_factory=lambda: _env_int("MAX_PER_SECTOR", 2)
+    )  # Max concurrent positions in same sector
 
 
 # ============================================
@@ -147,7 +150,7 @@ class TradingHours:
 class SignalConfig:
     """When to buy/sell."""
     min_confidence: float = field(
-        default_factory=lambda: _env_float("MIN_CONFIDENCE", 0.65)
+        default_factory=lambda: _env_float("MIN_CONFIDENCE", 0.55)
     )
     min_risk_reward: float = field(
         default_factory=lambda: _env_float("MIN_RISK_REWARD", 1.8)
@@ -168,8 +171,11 @@ class SignalConfig:
         default_factory=lambda: _env_float("MAX_STOP_DISTANCE_PCT", 0.03)
     )
     signal_max_age_seconds: int = field(
-        default_factory=lambda: _env_int("SIGNAL_MAX_AGE_SECONDS", 1800)
-    )  # Reject signals older than 30 min
+        default_factory=lambda: _env_int("SIGNAL_MAX_AGE_SECONDS", 300)
+    )  # Reject signals older than 5 min (intraday needs freshness)
+    max_daily_trades: int = field(
+        default_factory=lambda: _env_int("MAX_DAILY_TRADES", 6)
+    )  # Prevent overtrading in volatile markets
     gap_down_reject_pct: float = field(
         default_factory=lambda: _env_float("GAP_DOWN_REJECT_PCT", 0.05)
     )  # Reject entry if stock gapped down >5% from prev close

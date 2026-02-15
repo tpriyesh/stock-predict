@@ -146,10 +146,18 @@ class MarketFeatures:
         adjustments = {
             'RISK_ON': 1.1,
             'NEUTRAL': 1.0,
+            'CAUTIOUS': 0.9,
             'RISK_OFF': 0.8
         }
 
-        return adjustments.get(regime, 1.0)
+        base = adjustments.get(regime, 1.0)
+
+        # Additional penalty for rising VIX (increasing fear)
+        vix_trend = market_context.get('regime', {}).get('vix_trend', 'STABLE')
+        if vix_trend == 'RISING':
+            base *= 0.95
+
+        return base
 
     def get_vix_signal(self, market_context: Optional[dict] = None) -> dict:
         """

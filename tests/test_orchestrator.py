@@ -27,16 +27,23 @@ def _make_orchestrator(mock_broker, risk_manager):
     with patch('agent.orchestrator.SignalAdapter') as MockSA, \
          patch('agent.orchestrator.NewsFetcher'), \
          patch('agent.orchestrator.NewsFeatureExtractor'), \
+         patch('agent.orchestrator.MarketFeatures') as MockMF, \
          patch('agent.orchestrator.get_trade_db') as mock_db_fn, \
          patch('agent.orchestrator.get_limiter') as mock_limiter_fn, \
          patch('agent.orchestrator.alert_startup'), \
          patch('agent.orchestrator.CONFIG') as mock_config:
 
+        # MarketFeatures mock: return 'Unknown' sector by default (bypass sector limit)
+        mock_mf_instance = MockMF.return_value
+        mock_mf_instance.get_symbol_sector.return_value = 'Unknown'
+
         # Setup CONFIG mock
         mock_config.capital.max_positions = 5
         mock_config.capital.max_per_trade_risk_pct = 0.02
         mock_config.capital.max_position_pct = 0.30
+        mock_config.capital.max_per_sector = 2
         mock_config.capital.estimated_fee_pct = 0.0  # No fees in unit tests
+        mock_config.signals.max_daily_trades = 20  # High limit for tests
         mock_config.strategy.trailing_distance_pct = 0.008
         mock_config.strategy.trailing_start_pct = 0.01
         mock_config.intervals.quote_refresh_seconds = 1

@@ -218,7 +218,9 @@ class RiskManager:
         symbol: str,
         entry_price: float,
         stop_loss: float,
-        direction: str = 'BUY'
+        direction: str = 'BUY',
+        atr_pct: float = 0.0,
+        avg_daily_volume: int = 0
     ) -> RiskCheck:
         """
         Validate if a specific trade is allowed.
@@ -289,8 +291,19 @@ class RiskManager:
         if circuit_check:
             return RiskCheck(allowed=False, reason=circuit_check)
 
-        # Calculate position size
-        max_qty, max_value = self.calculate_position_size(entry_price, stop_loss)
+        # Calculate position size (with volatility adjustment if ATR provided)
+        max_qty, max_value = self.calculate_position_size(entry_price, stop_loss, atr_pct=atr_pct)
+
+        # Volume-based position cap: max 5% of avg daily volume
+        if avg_daily_volume > 0:
+            max_by_volume = int(avg_daily_volume * 0.05)
+            if max_by_volume > 0 and max_qty > max_by_volume:
+                logger.debug(
+                    f"Volume cap: {symbol} qty {max_qty} → {max_by_volume} "
+                    f"(5% of avg volume {avg_daily_volume})"
+                )
+                max_qty = max_by_volume
+                max_value = max_qty * entry_price
 
         if max_qty <= 0:
             return RiskCheck(
@@ -313,18 +326,26 @@ class RiskManager:
     def calculate_position_size(
         self,
         entry_price: float,
-        stop_loss: float
+        stop_loss: float,
+        atr_pct: float = 0.0
     ) -> Tuple[int, float]:
         """
         Calculate optimal position size based on risk.
 
-        Method: Risk-based sizing with capital limit cap and slippage buffer.
+        Method: Risk-based sizing with capital limit cap, slippage buffer,
+        and volatility adjustment.
 
         Formula:
         1. Risk per share = |entry - stop_loss| * (1 + slippage)
         2. Max risk amount = max_per_trade (2% of capital)
         3. Quantity by risk = max_risk / risk_per_share
-        4. Cap by max position value (30% of capital)
+        4. Volatility adjustment: scale down for high-ATR stocks
+        5. Cap by max position value (30% of capital)
+
+        Args:
+            entry_price: Planned entry price
+            stop_loss: Planned stop loss
+            atr_pct: ATR as percentage of price (e.g. 0.02 = 2%). 0 = no adjustment.
 
         Returns:
             Tuple of (quantity, position_value)
@@ -346,6 +367,13 @@ class RiskManager:
         # Quantity based on risk (2% max loss, adjusted for slippage)
         qty_by_risk = int(self.max_per_trade / risk_per_share)
 
+        # Volatility adjustment: high ATR → smaller position
+        # atr_pct is in percentage form (e.g. 1.8 = 1.8%)
+        if atr_pct > 0:
+            baseline_atr = 1.5  # ~1.5% is median for NIFTY50 large-caps
+            vol_multiplier = min(1.0, baseline_atr / atr_pct)
+            qty_by_risk = int(qty_by_risk * vol_multiplier)
+
         # Quantity based on capital
         qty_by_capital = int(max_position_value / entry_price) if entry_price > 0 else 0
 
@@ -357,7 +385,7 @@ class RiskManager:
         logger.debug(
             f"Position sizing: raw_risk={raw_risk:.2f}, slippage_adj_risk={risk_per_share:.2f}, "
             f"qty_by_risk={qty_by_risk}, qty_by_capital={qty_by_capital}, "
-            f"final_qty={quantity}"
+            f"atr_pct={atr_pct:.3f}, final_qty={quantity}"
         )
 
         return quantity, position_value

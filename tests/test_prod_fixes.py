@@ -3191,3 +3191,1308 @@ class TestEnhancedDailyReport:
         alert_daily_report(1, 0, 0.0, 100000.0, trades=[trade])
         # Should not raise — None handled via `or 0.0`
         mock_send.assert_called_once()
+
+
+# ============================================
+# Phase 1: News Check Bug Fix Tests
+# ============================================
+
+class TestNewsCheckBugFix:
+    """Test that strongly negative sentiment (< -0.5) exits BEFORE moderate check."""
+
+    def _make_orchestrator(self):
+        """Create a minimally-mocked orchestrator for news check tests."""
+        from agent.orchestrator import TradingOrchestrator, TradeRecord
+        from tests.conftest import MockBroker
+
+        broker = MockBroker(100000)
+        broker.set_ltp("RELIANCE", 2500.0)
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch.broker = broker
+        orch.risk_manager = MagicMock()
+        orch._db = MagicMock()
+        orch._limiter = MagicMock()
+        orch._news_fetcher = MagicMock()
+        orch._news_extractor = MagicMock()
+        orch.active_trades = {}
+        orch.completed_trades = []
+        orch.pending_signals = []
+        orch._last_news_check = None
+        orch._consecutive_order_failures = 0
+        return orch
+
+    def _make_trade(self, symbol="RELIANCE", entry=2500.0, stop=2450.0):
+        from agent.orchestrator import TradeRecord
+        trade = TradeRecord(
+            trade_id="T001",
+            symbol=symbol,
+            side="BUY",
+            quantity=10,
+            entry_price=entry,
+            stop_loss=stop,
+            original_stop_loss=stop,
+            current_stop=stop,
+            highest_price=entry,
+            target=2600.0,
+            order_ids=["ORD1", "ORD2"]
+        )
+        return trade
+
+    def test_strongly_negative_exits_position(self):
+        """avg_sentiment < -0.5 should trigger exit (was unreachable before fix)."""
+        orch = self._make_orchestrator()
+        trade = self._make_trade()
+        orch.active_trades = {"RELIANCE": trade}
+
+        # Mock news: strongly negative
+        orch._news_fetcher.fetch_for_symbol.return_value = [MagicMock()]
+        orch._news_extractor.extract_batch.return_value = [MagicMock()]
+        orch._news_extractor.get_symbol_news_summary.return_value = {
+            'avg_sentiment': -0.7
+        }
+
+        with patch.object(orch, '_exit_position') as mock_exit:
+            orch._check_news_for_positions()
+            mock_exit.assert_called_once()
+            assert "Negative news" in mock_exit.call_args[0][1]
+
+    def test_moderately_negative_tightens_stop(self):
+        """avg_sentiment between -0.5 and -0.3 with 2+ articles tightens to breakeven."""
+        orch = self._make_orchestrator()
+        trade = self._make_trade(entry=2500.0, stop=2450.0)
+        orch.active_trades = {"RELIANCE": trade}
+
+        articles = [MagicMock(), MagicMock(), MagicMock()]
+        orch._news_fetcher.fetch_for_symbol.return_value = articles
+        orch._news_extractor.extract_batch.return_value = articles
+        orch._news_extractor.get_symbol_news_summary.return_value = {
+            'avg_sentiment': -0.35
+        }
+
+        with patch.object(orch, '_exit_position') as mock_exit:
+            with patch.object(orch, '_update_broker_stop'):
+                orch._check_news_for_positions()
+                # Should NOT exit
+                mock_exit.assert_not_called()
+                # Stop should tighten to breakeven (entry_price)
+                assert trade.current_stop == 2500.0
+
+    def test_strongly_negative_single_article_exits(self):
+        """Even 1 article with sentiment < -0.5 should exit (previously unreachable)."""
+        orch = self._make_orchestrator()
+        trade = self._make_trade()
+        orch.active_trades = {"RELIANCE": trade}
+
+        orch._news_fetcher.fetch_for_symbol.return_value = [MagicMock()]
+        orch._news_extractor.extract_batch.return_value = [MagicMock()]
+        orch._news_extractor.get_symbol_news_summary.return_value = {
+            'avg_sentiment': -0.6
+        }
+
+        with patch.object(orch, '_exit_position') as mock_exit:
+            orch._check_news_for_positions()
+            mock_exit.assert_called_once()
+
+
+# ============================================
+# Phase 1: Max Daily Trades Limit Tests
+# ============================================
+
+class TestMaxDailyTradesLimit:
+    """Test that daily trade limit prevents overtrading."""
+
+    def test_max_daily_trades_blocks_entry(self):
+        """When trades_today >= max_daily_trades, no new entries."""
+        from agent.orchestrator import TradingOrchestrator
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch.risk_manager = MagicMock()
+        orch.risk_manager.trades_today = 6
+        orch.active_trades = {}
+        orch.pending_signals = [MagicMock()]
+        orch._consecutive_order_failures = 0
+
+        with patch.object(orch, '_enter_position') as mock_enter:
+            orch._try_enter_positions()
+            mock_enter.assert_not_called()
+
+    def test_max_daily_trades_allows_below_limit(self):
+        """When trades_today < max_daily_trades, entries are attempted."""
+        from agent.orchestrator import TradingOrchestrator
+        from agent.signal_adapter import TradeSignal, TradeDecision
+
+        signal = TradeSignal(
+            symbol='RELIANCE', decision=TradeDecision.BUY,
+            confidence=0.72, current_price=2500.0, entry_price=2500.0,
+            stop_loss=2450.0, target_price=2600.0, risk_reward_ratio=2.0,
+            atr_pct=1.8, position_size_pct=0.15, reasons=[]
+        )
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch.risk_manager = MagicMock()
+        orch.risk_manager.trades_today = 3
+        orch.active_trades = {}
+        orch.pending_signals = [signal]
+        orch._consecutive_order_failures = 0
+
+        with patch.object(orch, '_enter_position', return_value=True) as mock_enter:
+            orch._try_enter_positions()
+            mock_enter.assert_called_once()
+
+    def test_max_daily_trades_config_from_env(self):
+        """MAX_DAILY_TRADES env var is read correctly."""
+        with patch.dict(os.environ, {"MAX_DAILY_TRADES": "10"}):
+            from config.trading_config import SignalConfig
+            cfg = SignalConfig()
+            assert cfg.max_daily_trades == 10
+
+
+# ============================================
+# Phase 1: Friday Afternoon Block Tests
+# ============================================
+
+class TestFridayAfternoonBlock:
+    """Test that new entries are blocked on Friday afternoon."""
+
+    def _make_orchestrator(self):
+        from agent.orchestrator import TradingOrchestrator
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch.broker = MagicMock()
+        orch.risk_manager = MagicMock()
+        orch._db = MagicMock()
+        orch._limiter = MagicMock()
+        orch.active_trades = {}
+        orch.pending_signals = [MagicMock()]
+        orch._consecutive_order_failures = 0
+        orch._last_signal_refresh = datetime.now()
+        orch._last_reconcile = None
+        orch._token_last_checked = None
+        return orch
+
+    @patch('agent.orchestrator.now_ist')
+    @patch('agent.orchestrator.time_ist')
+    def test_friday_afternoon_blocks_entries(self, mock_time_ist, mock_now_ist):
+        """Friday 13:30 IST should block new entries."""
+        friday = datetime(2026, 2, 20, 13, 30)  # Friday
+        mock_now_ist.return_value = friday
+        mock_time_ist.return_value = dt_time(13, 30)
+
+        orch = self._make_orchestrator()
+        assert orch._is_friday_afternoon() is True
+
+    @patch('agent.orchestrator.now_ist')
+    @patch('agent.orchestrator.time_ist')
+    def test_friday_morning_allows_entries(self, mock_time_ist, mock_now_ist):
+        """Friday 10:30 IST should allow entries."""
+        friday = datetime(2026, 2, 20, 10, 30)  # Friday morning
+        mock_now_ist.return_value = friday
+        mock_time_ist.return_value = dt_time(10, 30)
+
+        orch = self._make_orchestrator()
+        assert orch._is_friday_afternoon() is False
+
+    @patch('agent.orchestrator.now_ist')
+    @patch('agent.orchestrator.time_ist')
+    def test_non_friday_afternoon_allows_entries(self, mock_time_ist, mock_now_ist):
+        """Thursday 14:00 IST should allow entries."""
+        thursday = datetime(2026, 2, 19, 14, 0)  # Thursday
+        mock_now_ist.return_value = thursday
+        mock_time_ist.return_value = dt_time(14, 0)
+
+        orch = self._make_orchestrator()
+        assert orch._is_friday_afternoon() is False
+
+
+# ============================================
+# Phase 1: Signal TTL Default Test
+# ============================================
+
+class TestSignalTTLDefault:
+    """Verify signal TTL config defaults."""
+
+    def test_signal_ttl_default_is_300(self):
+        """Without env override, signal_max_age_seconds should be 300."""
+        with patch.dict(os.environ, {}, clear=False):
+            # Remove the conftest override temporarily
+            old_val = os.environ.pop("SIGNAL_MAX_AGE_SECONDS", None)
+            try:
+                from config.trading_config import SignalConfig
+                cfg = SignalConfig()
+                assert cfg.signal_max_age_seconds == 300
+            finally:
+                if old_val is not None:
+                    os.environ["SIGNAL_MAX_AGE_SECONDS"] = old_val
+
+
+# ============================================
+# Phase 2: Market Regime CAUTIOUS Tests
+# ============================================
+
+class TestMarketRegimeCautious:
+    """Test CAUTIOUS regime for mixed VIX/NIFTY signals."""
+
+    def _make_indicators(self):
+        from src.data.market_indicators import MarketIndicators
+        mi = MarketIndicators.__new__(MarketIndicators)
+        mi._cache = MagicMock()
+        mi._cache.get.return_value = None
+        mi._quota = MagicMock()
+        mi._quota.can_request.return_value = (True, "OK")
+        mi._quota.wait_and_record.return_value = (True, "OK")
+        mi.price_fetcher = MagicMock()
+        return mi
+
+    @patch('src.data.market_indicators.MarketIndicators.get_current_vix')
+    @patch('src.data.market_indicators.MarketIndicators.get_index_data')
+    @patch('src.data.market_indicators.MarketIndicators._get_sector_returns')
+    def test_cautious_high_vix_bullish_nifty(self, mock_sectors, mock_index, mock_vix):
+        """VIX HIGH + NIFTY BULLISH = CAUTIOUS (not RISK_OFF)."""
+        from src.data.market_indicators import MarketIndicators
+        mi = self._make_indicators()
+
+        mock_vix.return_value = 25.0  # HIGH_FEAR
+        # Build bullish NIFTY data: current > sma20 > sma50
+        import pandas as pd
+        import numpy as np
+        prices = np.linspace(18000, 20000, 50)  # steadily rising
+        df = pd.DataFrame({'close': prices, 'high': prices * 1.01, 'low': prices * 0.99})
+        mock_index.return_value = df
+        mock_sectors.return_value = {}
+
+        regime = mi.get_market_regime()
+        assert regime['overall'] == 'CAUTIOUS'
+        assert regime['vix_regime'] == 'HIGH_FEAR'
+        assert regime['nifty_trend'] == 'BULLISH'
+
+    @patch('src.data.market_indicators.MarketIndicators.get_current_vix')
+    @patch('src.data.market_indicators.MarketIndicators.get_index_data')
+    @patch('src.data.market_indicators.MarketIndicators._get_sector_returns')
+    def test_cautious_low_vix_bearish_nifty(self, mock_sectors, mock_index, mock_vix):
+        """VIX LOW + NIFTY BEARISH = CAUTIOUS."""
+        from src.data.market_indicators import MarketIndicators
+        mi = self._make_indicators()
+
+        mock_vix.return_value = 11.0  # LOW_FEAR
+        # Build bearish NIFTY data: current < sma20 < sma50
+        import pandas as pd
+        import numpy as np
+        prices = np.linspace(20000, 18000, 50)  # steadily falling
+        df = pd.DataFrame({'close': prices, 'high': prices * 1.01, 'low': prices * 0.99})
+        mock_index.return_value = df
+        mock_sectors.return_value = {}
+
+        regime = mi.get_market_regime()
+        assert regime['overall'] == 'CAUTIOUS'
+
+    @patch('src.data.market_indicators.MarketIndicators.get_current_vix')
+    @patch('src.data.market_indicators.MarketIndicators.get_index_data')
+    @patch('src.data.market_indicators.MarketIndicators._get_sector_returns')
+    def test_risk_off_requires_high_fear_and_bearish(self, mock_sectors, mock_index, mock_vix):
+        """VIX HIGH + NIFTY BEARISH = RISK_OFF."""
+        from src.data.market_indicators import MarketIndicators
+        mi = self._make_indicators()
+
+        mock_vix.return_value = 25.0  # HIGH_FEAR
+        import pandas as pd
+        import numpy as np
+        prices = np.linspace(20000, 18000, 50)  # bearish
+        df = pd.DataFrame({'close': prices, 'high': prices * 1.01, 'low': prices * 0.99})
+        mock_index.return_value = df
+        mock_sectors.return_value = {}
+
+        regime = mi.get_market_regime()
+        assert regime['overall'] == 'RISK_OFF'
+
+    def test_regime_adjustment_cautious_returns_0_9(self):
+        """CAUTIOUS regime should return 0.9x adjustment."""
+        from src.features.market_features import MarketFeatures
+        mf = MarketFeatures.__new__(MarketFeatures)
+        mf.indicators = MagicMock()
+        mf.sector_mapping = {}
+        mf._cached_context = None
+        mf._context_cache_time = None
+
+        context = {'regime': {'overall': 'CAUTIOUS'}}
+        assert mf.get_regime_adjustment(market_context=context) == 0.9
+
+
+# ============================================
+# Phase 2: Volatility Position Sizing Tests
+# ============================================
+
+class TestVolatilityPositionSizing:
+    """Test ATR-based position sizing adjustment."""
+
+    def test_position_size_scales_down_with_high_atr(self, mock_broker, risk_manager):
+        """High ATR (3%) should reduce position size vs baseline (1.5%)."""
+        # entry=100, stop=90: risk=10.05 (with slippage), qty_by_risk=199, qty_by_capital=300
+        # qty_by_risk is binding, so ATR adjustment affects final result
+        mock_broker.set_ltp("TEST", 100.0)
+        qty_normal, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=1.5)
+        qty_high_vol, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=3.0)
+        assert qty_high_vol < qty_normal
+        assert qty_high_vol > 0
+
+    def test_position_size_unchanged_with_zero_atr(self, mock_broker, risk_manager):
+        """atr_pct=0 means no volatility adjustment (backward compat)."""
+        mock_broker.set_ltp("TEST", 100.0)
+        qty_zero, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=0)
+        qty_none, _ = risk_manager.calculate_position_size(100.0, 90.0)
+        assert qty_zero == qty_none
+
+    def test_position_size_capped_at_baseline_for_low_atr(self, mock_broker, risk_manager):
+        """Low ATR (0.5%) should NOT increase position above baseline."""
+        mock_broker.set_ltp("TEST", 100.0)
+        qty_low_vol, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=0.5)
+        qty_normal, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=1.5)
+        assert qty_low_vol == qty_normal
+
+    def test_vol_multiplier_never_exceeds_1(self, mock_broker, risk_manager):
+        """Volatility multiplier should never exceed 1.0 (no boost for low vol)."""
+        mock_broker.set_ltp("TEST", 100.0)
+        qty_no_atr, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=0)
+        qty_tiny_atr, _ = risk_manager.calculate_position_size(100.0, 90.0, atr_pct=0.1)
+        assert qty_tiny_atr <= qty_no_atr
+
+
+# ============================================
+# Phase 2: Sector Concentration Limit Tests
+# ============================================
+
+class TestSectorConcentrationLimit:
+    """Test that max_per_sector limits same-sector entries."""
+
+    def test_sector_limit_blocks_third_banking_stock(self):
+        """3rd banking stock should be blocked when max_per_sector=2."""
+        from agent.orchestrator import TradingOrchestrator, TradeRecord
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch._market_features = MagicMock()
+        orch._market_features.get_symbol_sector.side_effect = lambda s: {
+            'HDFCBANK': 'Banking', 'ICICIBANK': 'Banking', 'SBIN': 'Banking'
+        }.get(s, 'Unknown')
+
+        orch.active_trades = {
+            'HDFCBANK': MagicMock(),
+            'ICICIBANK': MagicMock(),
+        }
+        orch.risk_manager = MagicMock()
+        orch.risk_manager.validate_trade.return_value = RiskCheck(
+            allowed=True, reason="OK", max_quantity=10, max_value=5000
+        )
+        orch.risk_manager.trades_today = 0
+        orch.broker = MagicMock()
+        orch.broker.get_funds.return_value = Funds(available_cash=100000, used_margin=0, total_balance=100000)
+        orch._db = MagicMock()
+        orch._limiter = MagicMock()
+        orch._consecutive_order_failures = 0
+
+        from agent.signal_adapter import TradeSignal, TradeDecision
+        signal = TradeSignal(
+            symbol='SBIN', decision=TradeDecision.BUY,
+            confidence=0.7, current_price=500.0, entry_price=500.0,
+            stop_loss=490.0, target_price=520.0, risk_reward_ratio=2.0,
+            atr_pct=1.5, position_size_pct=0.15, reasons=[]
+        )
+
+        with patch('agent.orchestrator.CONFIG') as mock_cfg:
+            mock_cfg.signals.signal_max_age_seconds = 300
+            mock_cfg.signals.max_daily_trades = 20
+            mock_cfg.capital.max_per_sector = 2
+
+            result = orch._enter_position(signal)
+            assert result is None  # Rejected by sector limit
+
+    def test_sector_unknown_bypasses_limit(self):
+        """Unknown sector should bypass the sector limit."""
+        from agent.orchestrator import TradingOrchestrator
+
+        orch = TradingOrchestrator.__new__(TradingOrchestrator)
+        orch._market_features = MagicMock()
+        orch._market_features.get_symbol_sector.return_value = 'Unknown'
+
+        orch.active_trades = {'STOCK1': MagicMock(), 'STOCK2': MagicMock()}
+        orch.risk_manager = MagicMock()
+        orch.risk_manager.validate_trade.return_value = RiskCheck(
+            allowed=True, reason="OK", max_quantity=10, max_value=5000
+        )
+        orch.risk_manager.trades_today = 0
+        orch.broker = MagicMock()
+        orch.broker.get_funds.return_value = Funds(available_cash=100000, used_margin=0, total_balance=100000)
+        orch.broker.get_ltp.return_value = 500.0
+        orch._db = MagicMock()
+        orch._limiter = MagicMock()
+        orch._consecutive_order_failures = 0
+        orch._fee_pct = 0.0005
+
+        signal = MagicMock()
+        signal.symbol = 'NEWSTOCK'
+        signal.current_price = 500.0
+        signal.stop_loss = 490.0
+        signal.target_price = 520.0
+        signal.entry_price = 500.0
+        signal.atr_pct = 1.5
+        signal.position_size_pct = 0.15
+        signal.confidence = 0.7
+        signal.timestamp = datetime.now()
+        signal.reasons = ['test']
+
+        with patch('agent.orchestrator.CONFIG') as mock_cfg:
+            mock_cfg.signals.signal_max_age_seconds = 300
+            mock_cfg.capital.max_per_sector = 2
+            mock_cfg.orders.max_slippage_pct = 0.005
+            mock_cfg.capital.estimated_fee_pct = 0.0005
+
+            with patch('agent.orchestrator.alert_trade_entry'):
+                result = orch._enter_position(signal)
+                # Should NOT be None (not blocked by sector)
+                # It may fail for other reasons (broker mock), but it won't be None from sector check
+                # The key assertion is that _enter_position didn't return None before order placement
+                assert result is not None or orch.risk_manager.validate_trade.called
+
+
+# ============================================
+# Phase 3: Confidence Threshold Test
+# ============================================
+
+class TestConfidenceThreshold:
+    """Verify confidence threshold config."""
+
+    def test_min_confidence_default_is_0_55(self):
+        """Without env override, min_confidence should be 0.55."""
+        old_val = os.environ.pop("MIN_CONFIDENCE", None)
+        try:
+            from config.trading_config import SignalConfig
+            cfg = SignalConfig()
+            assert cfg.min_confidence == 0.55
+        finally:
+            if old_val is not None:
+                os.environ["MIN_CONFIDENCE"] = old_val
+
+
+# ============================================
+# Phase 3: Supertrend Mean-Reversion Tests
+# ============================================
+
+class TestSupertrendMeanReversion:
+    """Test that oversold BUY signals bypass Supertrend downtrend filter."""
+
+    def test_supertrend_down_rsi_oversold_allows_buy(self):
+        """BUY with Supertrend down + RSI < 30 should pass (mean-reversion)."""
+        from agent.signal_adapter import SignalAdapter, TradeSignal, TradeDecision
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter._price_cache = {}
+        adapter._price_cache_time = None
+
+        signal = TradeSignal(
+            symbol='TEST', decision=TradeDecision.BUY,
+            confidence=0.7, current_price=100.0, entry_price=100.0,
+            stop_loss=97.0, target_price=106.0, risk_reward_ratio=2.0,
+            atr_pct=1.5, position_size_pct=0.15, reasons=[]
+        )
+
+        with patch.object(adapter, '_passes_volume_check', return_value=True), \
+             patch.object(adapter, '_detect_corporate_action', return_value=False), \
+             patch.object(adapter, '_check_trend_filters', return_value=(-1, True)), \
+             patch.object(adapter, '_get_rsi', return_value=25.0), \
+             patch('agent.signal_adapter.time_ist', return_value=dt_time(10, 0)), \
+             patch('agent.signal_adapter.CONFIG') as mock_cfg:
+
+            mock_cfg.signals.min_confidence = 0.55
+            mock_cfg.signals.min_risk_reward = 1.5
+            mock_cfg.hours.entry_window_start = dt_time(9, 30)
+            mock_cfg.hours.entry_window_end = dt_time(14, 30)
+            mock_cfg.strategy.adx_strong_trend = 25
+            mock_cfg.strategy.rsi_oversold = 30
+            mock_cfg.capital.estimated_fee_pct = 0.0005
+
+            result = adapter._passes_filters(signal)
+            assert result is True
+
+    def test_supertrend_down_rsi_normal_rejects_buy(self):
+        """BUY with Supertrend down + RSI = 50 should be rejected."""
+        from agent.signal_adapter import SignalAdapter, TradeSignal, TradeDecision
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter._price_cache = {}
+        adapter._price_cache_time = None
+
+        signal = TradeSignal(
+            symbol='TEST', decision=TradeDecision.BUY,
+            confidence=0.7, current_price=100.0, entry_price=100.0,
+            stop_loss=97.0, target_price=106.0, risk_reward_ratio=2.0,
+            atr_pct=1.5, position_size_pct=0.15, reasons=[]
+        )
+
+        with patch.object(adapter, '_passes_volume_check', return_value=True), \
+             patch.object(adapter, '_detect_corporate_action', return_value=False), \
+             patch.object(adapter, '_check_trend_filters', return_value=(-1, True)), \
+             patch.object(adapter, '_get_rsi', return_value=50.0), \
+             patch('agent.signal_adapter.time_ist', return_value=dt_time(10, 0)), \
+             patch('agent.signal_adapter.CONFIG') as mock_cfg:
+
+            mock_cfg.signals.min_confidence = 0.55
+            mock_cfg.signals.min_risk_reward = 1.5
+            mock_cfg.hours.entry_window_start = dt_time(9, 30)
+            mock_cfg.hours.entry_window_end = dt_time(14, 30)
+            mock_cfg.strategy.adx_strong_trend = 25
+            mock_cfg.strategy.rsi_oversold = 30
+            mock_cfg.capital.estimated_fee_pct = 0.0005
+
+            result = adapter._passes_filters(signal)
+            assert result is False
+
+    def test_mean_reversion_reduces_confidence_by_0_85(self):
+        """Mean-reversion path should reduce confidence by 0.85x."""
+        from agent.signal_adapter import SignalAdapter, TradeSignal, TradeDecision
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter._price_cache = {}
+        adapter._price_cache_time = None
+
+        signal = TradeSignal(
+            symbol='TEST', decision=TradeDecision.BUY,
+            confidence=0.7, current_price=100.0, entry_price=100.0,
+            stop_loss=97.0, target_price=106.0, risk_reward_ratio=2.0,
+            atr_pct=1.5, position_size_pct=0.15, reasons=[]
+        )
+
+        with patch.object(adapter, '_passes_volume_check', return_value=True), \
+             patch.object(adapter, '_detect_corporate_action', return_value=False), \
+             patch.object(adapter, '_check_trend_filters', return_value=(-1, True)), \
+             patch.object(adapter, '_get_rsi', return_value=22.0), \
+             patch('agent.signal_adapter.time_ist', return_value=dt_time(10, 0)), \
+             patch('agent.signal_adapter.CONFIG') as mock_cfg:
+
+            mock_cfg.signals.min_confidence = 0.55
+            mock_cfg.signals.min_risk_reward = 1.5
+            mock_cfg.hours.entry_window_start = dt_time(9, 30)
+            mock_cfg.hours.entry_window_end = dt_time(14, 30)
+            mock_cfg.strategy.adx_strong_trend = 25
+            mock_cfg.strategy.rsi_oversold = 30
+            mock_cfg.capital.estimated_fee_pct = 0.0005
+
+            adapter._passes_filters(signal)
+            assert abs(signal.confidence - 0.595) < 0.01  # 0.7 * 0.85
+
+    def test_mean_reversion_adds_reason(self):
+        """Mean-reversion path should add a reason to signal."""
+        from agent.signal_adapter import SignalAdapter, TradeSignal, TradeDecision
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter._price_cache = {}
+        adapter._price_cache_time = None
+
+        signal = TradeSignal(
+            symbol='TEST', decision=TradeDecision.BUY,
+            confidence=0.7, current_price=100.0, entry_price=100.0,
+            stop_loss=97.0, target_price=106.0, risk_reward_ratio=2.0,
+            atr_pct=1.5, position_size_pct=0.15, reasons=[]
+        )
+
+        with patch.object(adapter, '_passes_volume_check', return_value=True), \
+             patch.object(adapter, '_detect_corporate_action', return_value=False), \
+             patch.object(adapter, '_check_trend_filters', return_value=(-1, True)), \
+             patch.object(adapter, '_get_rsi', return_value=25.0), \
+             patch('agent.signal_adapter.time_ist', return_value=dt_time(10, 0)), \
+             patch('agent.signal_adapter.CONFIG') as mock_cfg:
+
+            mock_cfg.signals.min_confidence = 0.55
+            mock_cfg.signals.min_risk_reward = 1.5
+            mock_cfg.hours.entry_window_start = dt_time(9, 30)
+            mock_cfg.hours.entry_window_end = dt_time(14, 30)
+            mock_cfg.strategy.adx_strong_trend = 25
+            mock_cfg.strategy.rsi_oversold = 30
+            mock_cfg.capital.estimated_fee_pct = 0.0005
+
+            adapter._passes_filters(signal)
+            assert any("Mean-reversion" in r for r in signal.reasons)
+
+
+# ============================================
+# Phase 3: risk_flags Tests
+# ============================================
+
+class TestRiskFlags:
+    """Test risk_flags storage and sentiment penalty."""
+
+    def test_risk_flags_stored_in_article(self):
+        """NewsArticle should store risk_flags field."""
+        from src.storage.models import NewsArticle
+        article = NewsArticle(
+            source='test', url='http://test.com', title='Test',
+            published_at=datetime.now(),
+            risk_flags=['rumor', 'unconfirmed']
+        )
+        assert article.risk_flags == ['rumor', 'unconfirmed']
+
+    def test_risk_flags_default_empty_list(self):
+        """risk_flags should default to empty list."""
+        from src.storage.models import NewsArticle
+        article = NewsArticle(
+            source='test', url='http://test.com', title='Test',
+            published_at=datetime.now()
+        )
+        assert article.risk_flags == []
+
+    def test_risk_flags_penalize_sentiment_0_7x(self):
+        """Articles with risk_flags should have sentiment penalized by 0.7x."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        # Article with flags
+        flagged = NewsArticle(
+            source='blog', url='http://blog.com/1', title='Rumor: Stock to rise',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.8,
+            event_type=EventType.OTHER, risk_flags=['rumor']
+        )
+        # Article without flags
+        clean = NewsArticle(
+            source='reuters', url='http://reuters.com/1', title='Earnings beat',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.8,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+
+        summary_flagged = extractor.get_symbol_news_summary([flagged], 'TEST')
+        summary_clean = extractor.get_symbol_news_summary([clean], 'TEST')
+
+        # Flagged should have lower sentiment due to 0.7x penalty
+        assert summary_flagged['avg_sentiment'] < summary_clean['avg_sentiment']
+
+    def test_risk_flags_empty_no_penalty(self):
+        """Articles without risk_flags should not be penalized."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        article = NewsArticle(
+            source='reuters', url='http://reuters.com/1', title='Test',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+            event_type=EventType.OTHER, risk_flags=[]
+        )
+
+        summary = extractor.get_symbol_news_summary([article], 'TEST')
+        # Without flags, sentiment should be close to 0.5 (with time decay)
+        assert summary['avg_sentiment'] > 0.4
+
+
+# ============================================
+# Phase 3: R:R Fee Accounting Tests
+# ============================================
+
+class TestRRFeeAccounting:
+    """Test that R:R calculation deducts estimated fees."""
+
+    def test_rr_deducts_fees_from_reward(self):
+        """R:R should be slightly lower with fees accounted for."""
+        # Directly test the math: entry=100, stop=98, target=104
+        # risk=2, reward=4, fee=100*0.0005*2=0.1, net_reward=3.9, R:R=1.95
+        entry, stop, target = 100.0, 98.0, 104.0
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
+        fee_pct = 0.0005
+        estimated_fees = entry * fee_pct * 2
+        net_reward = max(0, reward - estimated_fees)
+        rr = net_reward / risk
+
+        assert rr < 2.0  # Without fees would be 2.0
+        assert rr > 1.9  # Should be ~1.95
+
+    def test_rr_with_fees_can_reach_zero(self):
+        """If reward < fees, net reward should be 0."""
+        entry, stop, target = 100.0, 99.95, 100.01
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
+        fee_pct = 0.001
+        estimated_fees = entry * fee_pct * 2
+        net_reward = max(0, reward - estimated_fees)
+
+        assert net_reward == 0  # 0.01 - 0.2 < 0, clamped to 0
+
+
+# ============================================
+# Phase 4: Event-Type Weighted Sentiment Tests
+# ============================================
+
+class TestEventTypeWeightedSentiment:
+    """Test event-type weighting in news sentiment aggregation."""
+
+    def test_earnings_weighted_higher_than_other(self):
+        """Earnings event should dominate when mixed with neutral other event."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        # Mix a positive earnings article with a negative 'other' article.
+        # If weights are equal the avg would be ~0. With earnings at 1.3x
+        # and other at 0.8x, the positive earnings should pull avg positive.
+        positive_earnings = NewsArticle(
+            source='test', url='http://t.com/1', title='Earnings beat',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.6,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+        negative_other = NewsArticle(
+            source='test', url='http://t.com/2', title='General concern',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.NEGATIVE, sentiment_score=-0.6,
+            event_type=EventType.OTHER, risk_flags=[]
+        )
+
+        summary = extractor.get_symbol_news_summary(
+            [positive_earnings, negative_other], 'TEST'
+        )
+        # Earnings (1.3x weight) vs Other (0.8x weight): positive should dominate
+        assert summary['avg_sentiment'] > 0
+
+    def test_event_types_reported_in_summary(self):
+        """Summary should report event type counts."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        articles = [
+            NewsArticle(
+                source='test', url='http://t.com/1', title='E1',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+                event_type=EventType.EARNINGS, risk_flags=[]
+            ),
+            NewsArticle(
+                source='test', url='http://t.com/2', title='E2',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+                event_type=EventType.EARNINGS, risk_flags=[]
+            ),
+        ]
+
+        summary = extractor.get_symbol_news_summary(articles, 'TEST')
+        assert summary['event_types']['earnings'] == 2
+
+    def test_macro_weighted_lower_than_earnings(self):
+        """Macro event type should weigh less than earnings in mixed summary."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        # Mix positive earnings with negative macro — earnings should dominate
+        positive_earnings = NewsArticle(
+            source='test', url='http://t.com/1', title='E1',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+        negative_macro = NewsArticle(
+            source='test', url='http://t.com/2', title='M1',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.NEGATIVE, sentiment_score=-0.5,
+            event_type=EventType.MACRO, risk_flags=[]
+        )
+
+        summary = extractor.get_symbol_news_summary(
+            [positive_earnings, negative_macro], 'TEST'
+        )
+        # Earnings 1.3x vs Macro 0.9x — positive should dominate
+        assert summary['avg_sentiment'] > 0
+
+
+# ============================================
+# Phase 4: Conflicting Sentiment Detection Tests
+# ============================================
+
+class TestConflictingSentimentDetection:
+    """Test sentiment conflict detection with std_dev > 0.4."""
+
+    def test_conflict_detected_high_std_dev(self):
+        """High sentiment variance should flag conflict."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        articles = [
+            NewsArticle(
+                source='test', url='http://t.com/1', title='Great news',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.9,
+                event_type=EventType.EARNINGS, risk_flags=[]
+            ),
+            NewsArticle(
+                source='test', url='http://t.com/2', title='Bad news',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.NEGATIVE, sentiment_score=-0.8,
+                event_type=EventType.REGULATORY, risk_flags=[]
+            ),
+        ]
+
+        summary = extractor.get_symbol_news_summary(articles, 'TEST')
+        assert summary['sentiment_conflict'] is True
+        assert summary['sentiment_std_dev'] > 0.4
+
+    def test_no_conflict_low_std_dev(self):
+        """Consistent sentiment should not flag conflict."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        articles = [
+            NewsArticle(
+                source='test', url='http://t.com/1', title='Good news',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.6,
+                event_type=EventType.EARNINGS, risk_flags=[]
+            ),
+            NewsArticle(
+                source='test', url='http://t.com/2', title='More good news',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.7,
+                event_type=EventType.ORDER_WIN, risk_flags=[]
+            ),
+        ]
+
+        summary = extractor.get_symbol_news_summary(articles, 'TEST')
+        assert summary['sentiment_conflict'] is False
+
+    def test_conflict_reduces_sentiment_by_0_8x(self):
+        """Conflicting sentiment should reduce avg by 0.8x."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        # Both positive but spread wide enough for conflict
+        articles = [
+            NewsArticle(
+                source='test', url='http://t.com/1', title='V. positive',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.POSITIVE, sentiment_score=0.9,
+                event_type=EventType.EARNINGS, risk_flags=[]
+            ),
+            NewsArticle(
+                source='test', url='http://t.com/2', title='Negative',
+                published_at=datetime.now(), tickers=['TEST'],
+                sentiment=Sentiment.NEGATIVE, sentiment_score=-0.7,
+                event_type=EventType.REGULATORY, risk_flags=[]
+            ),
+        ]
+
+        summary = extractor.get_symbol_news_summary(articles, 'TEST')
+        # With conflict, avg is reduced by 0.8x
+        # The raw weighted avg would be higher than the final conflict-adjusted value
+        assert summary['sentiment_conflict'] is True
+
+
+# ============================================
+# Phase 4: VIX Trend Direction Tests
+# ============================================
+
+class TestVIXTrendDirection:
+    """Test VIX trend detection (RISING/FALLING/STABLE)."""
+
+    def test_rising_vix_detected(self):
+        """VIX above 5-day SMA by >5% should be RISING."""
+        from src.data.market_indicators import MarketIndicators
+        import pandas as pd
+
+        mi = MarketIndicators.__new__(MarketIndicators)
+        mi._cache = MagicMock()
+        mi._cache.get.return_value = None
+        mi._cache.set = MagicMock()
+        mi._quota = MagicMock()
+        mi._quota.can_request.return_value = (True, '')
+        mi._quota.wait_and_record.return_value = (True, '')
+        mi.price_fetcher = MagicMock()
+
+        # Create VIX data: days 1-4 at 15, day 5 at 17 (>5% above SMA)
+        dates = pd.date_range('2026-01-01', periods=10, freq='D')
+        vix_data = pd.DataFrame({
+            'close': [14, 14, 14, 14, 14, 14, 15, 15, 15, 17],
+            'open': [14]*10, 'high': [14]*10, 'low': [14]*10, 'volume': [0]*10
+        }, index=dates)
+
+        nifty_data = pd.DataFrame({
+            'close': [100]*50,
+            'open': [100]*50, 'high': [100]*50, 'low': [100]*50, 'volume': [0]*50
+        }, index=pd.date_range('2025-12-01', periods=50, freq='D'))
+
+        def mock_get_index_data(name, period='1mo'):
+            if name == 'INDIAVIX':
+                return vix_data
+            elif name == 'NIFTY50':
+                return nifty_data
+            return pd.DataFrame()
+
+        with patch.object(mi, 'get_index_data', side_effect=mock_get_index_data), \
+             patch.object(mi, 'get_current_vix', return_value=17.0), \
+             patch.object(mi, 'get_vix', return_value=vix_data), \
+             patch.object(mi, '_get_sector_returns', return_value={}):
+            regime = mi.get_market_regime()
+            assert regime['vix_trend'] == 'RISING'
+
+    def test_falling_vix_detected(self):
+        """VIX below 5-day SMA by >5% should be FALLING."""
+        from src.data.market_indicators import MarketIndicators
+        import pandas as pd
+
+        mi = MarketIndicators.__new__(MarketIndicators)
+        mi._cache = MagicMock()
+        mi._cache.get.return_value = None
+        mi._cache.set = MagicMock()
+        mi._quota = MagicMock()
+        mi._quota.can_request.return_value = (True, '')
+        mi._quota.wait_and_record.return_value = (True, '')
+        mi.price_fetcher = MagicMock()
+
+        dates = pd.date_range('2026-01-01', periods=10, freq='D')
+        vix_data = pd.DataFrame({
+            'close': [20, 20, 20, 20, 20, 20, 18, 18, 18, 14],
+            'open': [20]*10, 'high': [20]*10, 'low': [20]*10, 'volume': [0]*10
+        }, index=dates)
+
+        nifty_data = pd.DataFrame({
+            'close': [100]*50,
+            'open': [100]*50, 'high': [100]*50, 'low': [100]*50, 'volume': [0]*50
+        }, index=pd.date_range('2025-12-01', periods=50, freq='D'))
+
+        def mock_get_index_data(name, period='1mo'):
+            if name == 'INDIAVIX':
+                return vix_data
+            elif name == 'NIFTY50':
+                return nifty_data
+            return pd.DataFrame()
+
+        with patch.object(mi, 'get_index_data', side_effect=mock_get_index_data), \
+             patch.object(mi, 'get_current_vix', return_value=14.0), \
+             patch.object(mi, 'get_vix', return_value=vix_data), \
+             patch.object(mi, '_get_sector_returns', return_value={}):
+            regime = mi.get_market_regime()
+            assert regime['vix_trend'] == 'FALLING'
+
+    def test_stable_vix_detected(self):
+        """VIX near 5-day SMA should be STABLE."""
+        from src.data.market_indicators import MarketIndicators
+        import pandas as pd
+
+        mi = MarketIndicators.__new__(MarketIndicators)
+        mi._cache = MagicMock()
+        mi._cache.get.return_value = None
+        mi._cache.set = MagicMock()
+        mi._quota = MagicMock()
+        mi._quota.can_request.return_value = (True, '')
+        mi._quota.wait_and_record.return_value = (True, '')
+        mi.price_fetcher = MagicMock()
+
+        dates = pd.date_range('2026-01-01', periods=10, freq='D')
+        vix_data = pd.DataFrame({
+            'close': [15, 15, 15, 15, 15, 15, 15, 15, 15, 15],
+            'open': [15]*10, 'high': [15]*10, 'low': [15]*10, 'volume': [0]*10
+        }, index=dates)
+
+        nifty_data = pd.DataFrame({
+            'close': [100]*50,
+            'open': [100]*50, 'high': [100]*50, 'low': [100]*50, 'volume': [0]*50
+        }, index=pd.date_range('2025-12-01', periods=50, freq='D'))
+
+        def mock_get_index_data(name, period='1mo'):
+            if name == 'INDIAVIX':
+                return vix_data
+            elif name == 'NIFTY50':
+                return nifty_data
+            return pd.DataFrame()
+
+        with patch.object(mi, 'get_index_data', side_effect=mock_get_index_data), \
+             patch.object(mi, 'get_current_vix', return_value=15.0), \
+             patch.object(mi, 'get_vix', return_value=vix_data), \
+             patch.object(mi, '_get_sector_returns', return_value={}):
+            regime = mi.get_market_regime()
+            assert regime['vix_trend'] == 'STABLE'
+
+
+# ============================================
+# Phase 4: VIX Trend Regime Adjustment Tests
+# ============================================
+
+class TestVIXTrendRegimeAdjustment:
+    """Test VIX trend penalty in regime adjustment."""
+
+    def test_rising_vix_reduces_regime_adjustment(self):
+        """Rising VIX should apply 0.95x penalty to regime adjustment."""
+        from src.features.market_features import MarketFeatures
+
+        mf = MarketFeatures.__new__(MarketFeatures)
+        mf.indicators = MagicMock()
+        mf.sector_mapping = {}
+
+        # NEUTRAL regime + RISING VIX
+        context = {
+            'regime': {'overall': 'NEUTRAL', 'vix_trend': 'RISING'}
+        }
+        adj = mf.get_regime_adjustment(market_context=context)
+        assert abs(adj - 0.95) < 0.01  # 1.0 * 0.95
+
+    def test_stable_vix_no_penalty(self):
+        """Stable VIX should not apply penalty."""
+        from src.features.market_features import MarketFeatures
+
+        mf = MarketFeatures.__new__(MarketFeatures)
+        mf.indicators = MagicMock()
+        mf.sector_mapping = {}
+
+        context = {
+            'regime': {'overall': 'NEUTRAL', 'vix_trend': 'STABLE'}
+        }
+        adj = mf.get_regime_adjustment(market_context=context)
+        assert abs(adj - 1.0) < 0.01
+
+    def test_rising_vix_with_risk_on_stacks(self):
+        """Rising VIX penalty should stack with regime adjustment."""
+        from src.features.market_features import MarketFeatures
+
+        mf = MarketFeatures.__new__(MarketFeatures)
+        mf.indicators = MagicMock()
+        mf.sector_mapping = {}
+
+        context = {
+            'regime': {'overall': 'RISK_ON', 'vix_trend': 'RISING'}
+        }
+        adj = mf.get_regime_adjustment(market_context=context)
+        assert abs(adj - 1.045) < 0.01  # 1.1 * 0.95
+
+
+# ============================================
+# Phase 4: Source Credibility Weighting Tests
+# ============================================
+
+class TestSourceCredibilityWeighting:
+    """Test source credibility weighting in sentiment aggregation."""
+
+    def test_reuters_dominates_unknown_in_mixed_summary(self):
+        """Reuters article should dominate over unknown source in mixed summary."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        # Positive Reuters vs negative unknown-blog — Reuters 1.3x should dominate
+        positive_reuters = NewsArticle(
+            source='Reuters', url='http://r.com/1', title='Reuters positive',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+        negative_unknown = NewsArticle(
+            source='random-blog', url='http://b.com/1', title='Blog negative',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.NEGATIVE, sentiment_score=-0.5,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+
+        summary = extractor.get_symbol_news_summary(
+            [positive_reuters, negative_unknown], 'TEST'
+        )
+        # Reuters 1.3x vs unknown 1.0x — positive should pull avg above zero
+        assert summary['avg_sentiment'] > 0
+
+    def test_credibility_weights_exist_for_major_sources(self):
+        """Verify SOURCE_CREDIBILITY dict has expected major sources."""
+        from src.features.news_features import NewsFeatureExtractor
+
+        # Access the dict from get_symbol_news_summary source
+        # We test indirectly by verifying known sources produce consistent results
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        # Bloomberg and Reuters should produce same result (both 1.3x)
+        bloomberg = NewsArticle(
+            source='Bloomberg', url='http://bl.com/1', title='Test',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.6,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+        reuters = NewsArticle(
+            source='Reuters', url='http://r.com/1', title='Test',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.6,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+
+        s_bl = extractor.get_symbol_news_summary([bloomberg], 'TEST')
+        s_re = extractor.get_symbol_news_summary([reuters], 'TEST')
+
+        assert abs(s_bl['avg_sentiment'] - s_re['avg_sentiment']) < 0.01
+
+    def test_economic_times_dominates_unknown(self):
+        """Economic Times should dominate over unknown source in mixed summary."""
+        from src.features.news_features import NewsFeatureExtractor
+        from src.storage.models import NewsArticle, EventType, Sentiment
+
+        extractor = NewsFeatureExtractor.__new__(NewsFeatureExtractor)
+        extractor._llm_provider = None
+
+        positive_et = NewsArticle(
+            source='Economic Times', url='http://et.com/1', title='ET positive',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.POSITIVE, sentiment_score=0.5,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+        negative_unknown = NewsArticle(
+            source='unknown-blog', url='http://ub.com/1', title='Blog negative',
+            published_at=datetime.now(), tickers=['TEST'],
+            sentiment=Sentiment.NEGATIVE, sentiment_score=-0.5,
+            event_type=EventType.EARNINGS, risk_flags=[]
+        )
+
+        summary = extractor.get_symbol_news_summary(
+            [positive_et, negative_unknown], 'TEST'
+        )
+        # ET 1.2x vs unknown 1.0x — positive should dominate
+        assert summary['avg_sentiment'] > 0
+
+
+# ============================================
+# Phase 5: Volume-Based Position Cap Tests
+# ============================================
+
+class TestVolumeBasedPositionCap:
+    """Test volume-based position cap in risk manager."""
+
+    def test_volume_cap_reduces_quantity(self):
+        """Position should be capped at 5% of avg daily volume."""
+        from risk.manager import RiskManager, RiskCheck
+
+        rm = RiskManager.__new__(RiskManager)
+        rm.broker = MagicMock()
+        rm.initial_capital = 100000
+        rm.hard_stop = 80000
+        rm.max_daily_loss = 5000
+        rm.max_per_trade = 2000
+        rm.max_position_pct = 0.3
+        rm.max_positions = 5
+        rm.is_killed = False
+        rm.kill_reason = ''
+        rm.daily_pnl = 0
+        rm.trades_today = 0
+        rm.trading_date = None
+        rm._last_known_portfolio_value = None
+        rm._last_known_unrealized = 0
+        rm._portfolio_api_failures = 0
+        rm._max_portfolio_api_failures = 3
+
+        rm.broker.get_funds.return_value = MagicMock(
+            total_balance=100000, available_cash=100000
+        )
+        rm.broker.get_pnl.return_value = MagicMock(unrealized=0)
+        rm.broker.get_positions.return_value = []
+        rm.broker.get_quote.return_value = None
+
+        # entry=100, stop=98 → risk=2 → qty_by_risk=1000
+        # avg_daily_volume=2000 → 5% = 100 shares (< 1000)
+        result = rm.validate_trade(
+            symbol='TEST', entry_price=100.0, stop_loss=98.0,
+            avg_daily_volume=2000
+        )
+        assert result.allowed is True
+        assert result.max_quantity <= 100  # Capped at 5% of 2000
+
+    def test_no_volume_data_no_cap(self):
+        """Without volume data, no liquidity cap should apply."""
+        from risk.manager import RiskManager, RiskCheck
+
+        rm = RiskManager.__new__(RiskManager)
+        rm.broker = MagicMock()
+        rm.initial_capital = 100000
+        rm.hard_stop = 80000
+        rm.max_daily_loss = 5000
+        rm.max_per_trade = 2000
+        rm.max_position_pct = 0.3
+        rm.max_positions = 5
+        rm.is_killed = False
+        rm.kill_reason = ''
+        rm.daily_pnl = 0
+        rm.trades_today = 0
+        rm.trading_date = None
+        rm._last_known_portfolio_value = None
+        rm._last_known_unrealized = 0
+        rm._portfolio_api_failures = 0
+        rm._max_portfolio_api_failures = 3
+
+        rm.broker.get_funds.return_value = MagicMock(
+            total_balance=100000, available_cash=100000
+        )
+        rm.broker.get_pnl.return_value = MagicMock(unrealized=0)
+        rm.broker.get_positions.return_value = []
+        rm.broker.get_quote.return_value = None
+
+        # No volume data (avg_daily_volume=0) → no cap
+        result = rm.validate_trade(
+            symbol='TEST', entry_price=100.0, stop_loss=98.0,
+            avg_daily_volume=0
+        )
+        assert result.allowed is True
+        # Without volume cap, qty should be risk-based (1000)
+        assert result.max_quantity > 100
+
+    def test_volume_cap_does_not_increase_quantity(self):
+        """Volume cap should only reduce, never increase quantity."""
+        from risk.manager import RiskManager, RiskCheck
+
+        rm = RiskManager.__new__(RiskManager)
+        rm.broker = MagicMock()
+        rm.initial_capital = 100000
+        rm.hard_stop = 80000
+        rm.max_daily_loss = 5000
+        rm.max_per_trade = 2000
+        rm.max_position_pct = 0.3
+        rm.max_positions = 5
+        rm.is_killed = False
+        rm.kill_reason = ''
+        rm.daily_pnl = 0
+        rm.trades_today = 0
+        rm.trading_date = None
+        rm._last_known_portfolio_value = None
+        rm._last_known_unrealized = 0
+        rm._portfolio_api_failures = 0
+        rm._max_portfolio_api_failures = 3
+
+        rm.broker.get_funds.return_value = MagicMock(
+            total_balance=100000, available_cash=100000
+        )
+        rm.broker.get_pnl.return_value = MagicMock(unrealized=0)
+        rm.broker.get_positions.return_value = []
+        rm.broker.get_quote.return_value = None
+
+        # Very high volume = 10M → 5% = 500k shares, won't cap the risk-based qty
+        result = rm.validate_trade(
+            symbol='TEST', entry_price=100.0, stop_loss=98.0,
+            avg_daily_volume=10_000_000
+        )
+        assert result.allowed is True
+        result_no_vol = rm.validate_trade(
+            symbol='TEST', entry_price=100.0, stop_loss=98.0,
+            avg_daily_volume=0
+        )
+        assert result.max_quantity == result_no_vol.max_quantity

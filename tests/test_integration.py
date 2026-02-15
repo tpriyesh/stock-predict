@@ -70,14 +70,20 @@ def _make_orchestrator(mock_broker, risk_manager, trade_db=None):
     with patch('agent.orchestrator.SignalAdapter') as MockSA, \
          patch('agent.orchestrator.NewsFetcher'), \
          patch('agent.orchestrator.NewsFeatureExtractor'), \
+         patch('agent.orchestrator.MarketFeatures') as MockMF, \
          patch('agent.orchestrator.get_trade_db') as mock_db_fn, \
          patch('agent.orchestrator.get_limiter') as mock_limiter_fn, \
          patch('agent.orchestrator.alert_startup'), \
          patch('agent.orchestrator.CONFIG') as mock_config:
 
+        # MarketFeatures mock: return 'Unknown' sector by default (bypass sector limit)
+        mock_mf_instance = MockMF.return_value
+        mock_mf_instance.get_symbol_sector.return_value = 'Unknown'
+
         mock_config.capital.max_positions = 5
         mock_config.capital.max_per_trade_risk_pct = 0.02
         mock_config.capital.max_position_pct = 0.30
+        mock_config.capital.max_per_sector = 2
         mock_config.capital.estimated_fee_pct = 0.0  # No fees by default in tests
         mock_config.strategy.trailing_distance_pct = 0.008
         mock_config.strategy.trailing_start_pct = 0.01
@@ -85,6 +91,7 @@ def _make_orchestrator(mock_broker, risk_manager, trade_db=None):
         mock_config.intervals.position_check_seconds = 1
         mock_config.intervals.signal_refresh_seconds = 300
         mock_config.intervals.news_check_seconds = 600
+        mock_config.signals.max_daily_trades = 20  # High limit for tests
         mock_config.hours.pre_market_start = datetime.strptime("08:00", "%H:%M").time()
         mock_config.hours.market_open = datetime.strptime("09:15", "%H:%M").time()
         mock_config.hours.entry_window_start = datetime.strptime("09:30", "%H:%M").time()
