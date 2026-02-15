@@ -592,16 +592,29 @@ class UpstoxBroker(BaseBroker):
             return self._get_cached_funds_or_zero()
 
     def _get_cached_funds_or_zero(self) -> Funds:
-        """Return cached funds on API failure, zero only after 3+ consecutive failures."""
+        """Return cached funds on API failure. Uses cache permanently to avoid blocking trading."""
         self._funds_failure_count += 1
-        if self._last_known_funds and self._funds_failure_count < 3:
-            logger.warning(
-                f"Using cached funds (failure #{self._funds_failure_count}): "
-                f"available={self._last_known_funds.available_cash}"
-            )
+        if self._last_known_funds:
+            if self._funds_failure_count >= 3:
+                logger.error(
+                    f"Funds API failed {self._funds_failure_count} consecutive times. "
+                    f"Using STALE cached funds: Rs.{self._last_known_funds.available_cash:.0f}. "
+                    f"Check broker connectivity!"
+                )
+                from utils.alerts import alert_error
+                alert_error(
+                    "Funds API unreachable",
+                    f"Failed {self._funds_failure_count}x. Using cached Rs.{self._last_known_funds.available_cash:.0f}. "
+                    f"Verify broker dashboard."
+                )
+            else:
+                logger.warning(
+                    f"Using cached funds (failure #{self._funds_failure_count}): "
+                    f"available={self._last_known_funds.available_cash}"
+                )
             return self._last_known_funds
-        if self._funds_failure_count >= 3:
-            logger.error(f"Funds API failed {self._funds_failure_count} consecutive times, returning zero")
+        # No cache at all — truly unknown funds, return zero to prevent blind trading
+        logger.error(f"Funds API failed {self._funds_failure_count}x with NO cached data — returning zero")
         return Funds(available_cash=0, used_margin=0, total_balance=0)
 
     def get_pnl(self) -> PnL:

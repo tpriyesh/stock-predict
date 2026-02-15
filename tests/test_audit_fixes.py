@@ -152,14 +152,15 @@ class TestUpstoxFundCaching:
         assert result.available_cash == 50000
         assert broker._funds_failure_count == 1
 
-    def test_cached_funds_returns_zero_after_3_failures(self):
-        """After 3+ failures, returns zero (triggers kill switch)."""
+    def test_cached_funds_persists_after_3_failures(self):
+        """After 3+ failures, keeps using cache (sends alert, doesn't block trading)."""
         broker = self._make_broker()
         broker._last_known_funds = Funds(available_cash=50000, used_margin=10000, total_balance=60000)
         broker._funds_failure_count = 2  # Already at 2
 
-        result = broker._get_cached_funds_or_zero()
-        assert result.available_cash == 0
+        with patch('utils.alerts.alert_error'):
+            result = broker._get_cached_funds_or_zero()
+        assert result.available_cash == 50000  # Cache persists
         assert broker._funds_failure_count == 3
 
 
@@ -189,14 +190,15 @@ class TestZerodhaFundCaching:
         assert result.available_cash == 75000
         assert broker._funds_failure_count == 1
 
-    def test_cached_funds_zero_after_3(self):
-        """Returns zero after 3+ consecutive failures."""
+    def test_cached_funds_persists_after_3(self):
+        """After 3+ failures, keeps using cache (sends alert, doesn't block trading)."""
         broker = self._make_broker()
         broker._last_known_funds = Funds(available_cash=75000, used_margin=5000, total_balance=80000)
         broker._funds_failure_count = 2
 
-        result = broker._get_cached_funds_or_zero()
-        assert result.available_cash == 0
+        with patch('utils.alerts.alert_error'):
+            result = broker._get_cached_funds_or_zero()
+        assert result.available_cash == 75000  # Cache persists
 
     def test_no_cache_returns_zero_immediately(self):
         """No cache + first failure = zero immediately."""

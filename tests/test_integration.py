@@ -1122,26 +1122,24 @@ class TestCUJ_DoubleExitProtection:
 class TestCUJ_ExitPriceFallback:
     """When exit price is unavailable, system must not lose track of money."""
 
-    def test_exit_with_no_price_falls_back_to_entry(self, mock_broker, risk_manager):
-        """If exit_price is None AND LTP is 0, falls back to entry_price, P&L = 0."""
+    def test_exit_with_no_price_falls_back_to_stop(self, mock_broker, risk_manager):
+        """If exit_price is None AND LTP is 0, falls back to current_stop (worst-case)."""
         orch = _make_orchestrator(mock_broker, risk_manager)
 
-        trade = _make_trade("GHOST", entry_price=1000.0, quantity=10)
+        trade = _make_trade("GHOST", entry_price=1000.0, stop_loss=970.0, quantity=10)
         orch.active_trades["GHOST"] = trade
 
         # Set LTP to 0 (data error) — fallback should kick in
         mock_broker.set_ltp("GHOST", 0.0)
 
-        with patch('agent.orchestrator.alert_trade_exit'):
+        with patch('agent.orchestrator.alert_trade_exit'), \
+             patch('agent.orchestrator.alert_error'):
             orch._record_exit(trade, "Emergency exit", exit_price=None)
 
-        # Should fall back to entry_price since LTP is 0
-        assert trade.exit_price == 1000.0  # Fell back to entry
-        assert trade.pnl == 0.0  # No phantom P&L
+        # Should fall back to current_stop (worst-case), not entry_price
+        assert trade.exit_price == 970.0  # Fell back to stop loss
+        assert trade.pnl < 0  # Shows real loss, not phantom breakeven
         assert "GHOST" not in orch.active_trades
-
-        # Risk manager should record 0 P&L, not a phantom loss
-        assert risk_manager.daily_pnl == 0.0
 
     def test_exit_with_negative_price_falls_back(self, mock_broker, risk_manager):
         """exit_price <= 0 should trigger fallback, never record negative-price P&L."""
@@ -1373,25 +1371,26 @@ class TestCUJ_ExternalPositionClose:
         # P&L should still be tracked (uses LTP as fallback)
         assert risk_manager.trades_today == 1
 
-    def test_externally_closed_with_zero_ltp_uses_entry(self, mock_broker, risk_manager):
-        """If externally closed and LTP=0, P&L should be 0 (use entry_price)."""
+    def test_externally_closed_with_zero_ltp_uses_stop(self, mock_broker, risk_manager):
+        """If externally closed and LTP=0, fallback to current_stop (worst-case)."""
         orch = _make_orchestrator(mock_broker, risk_manager)
 
-        trade = _make_trade("VANISHED", entry_price=500.0, quantity=20)
+        trade = _make_trade("VANISHED", entry_price=500.0, stop_loss=485.0, quantity=20)
         orch.active_trades["VANISHED"] = trade
 
         # No broker position, LTP = 0
         mock_broker.set_ltp("VANISHED", 0.0)
 
         with patch('agent.orchestrator.alert_trade_exit'), \
+             patch('agent.orchestrator.alert_error'), \
              patch.object(orch, '_maybe_reconcile'):
             orch._check_positions()
 
         assert "VANISHED" not in orch.active_trades
         completed = orch.completed_trades[0]
-        # exit_price should be entry_price since LTP is 0
-        assert completed.exit_price == 500.0
-        assert completed.pnl == 0.0  # No phantom profit/loss
+        # exit_price should be current_stop (worst-case), not entry
+        assert completed.exit_price == 485.0
+        assert completed.pnl < 0  # Reflects real worst-case loss
 
 
 # ============================================

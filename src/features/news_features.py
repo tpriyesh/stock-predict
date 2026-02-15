@@ -166,9 +166,9 @@ Example output:
                 tickers=result.get('tickers', []),
                 event_type=EventType(result.get('event_type', 'other')),
                 sentiment=Sentiment(result.get('sentiment', 'neutral')),
-                sentiment_score=float(result.get('sentiment_score', 0.0)),
+                sentiment_score=max(-1.0, min(1.0, float(result.get('sentiment_score', 0.0)))),
                 key_claims=result.get('key_claims', []),
-                relevance_score=float(result.get('relevance_score', 0.5))
+                relevance_score=max(0.0, min(1.0, float(result.get('relevance_score', 0.5))))
             )
 
             # Cache the extracted result

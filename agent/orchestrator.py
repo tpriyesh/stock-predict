@@ -1181,8 +1181,20 @@ class TradingOrchestrator:
             except Exception:
                 pass
         if not exit_price or exit_price <= 0:
-            logger.warning(f"{symbol}: Could not get valid exit price, using entry price")
-            exit_price = trade.entry_price
+            # Fallback chain: current_stop > original_stop > entry_price
+            # Use stop loss (worst-case) to avoid masking real losses
+            fallback = trade.current_stop or trade.original_stop_loss or trade.entry_price
+            logger.error(
+                f"{symbol}: Could not get exit price, using fallback "
+                f"Rs.{fallback:.2f} (current_stop={trade.current_stop}, "
+                f"original_sl={trade.original_stop_loss}, entry={trade.entry_price})"
+            )
+            alert_error(
+                "Exit price unavailable",
+                f"{symbol}: Using fallback Rs.{fallback:.2f}. "
+                f"Verify actual exit price on broker dashboard."
+            )
+            exit_price = fallback
 
         trade.exit_price = exit_price
         trade.exit_time = now_ist().replace(tzinfo=None)
