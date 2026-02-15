@@ -19,12 +19,17 @@ from utils.platform import now_ist
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Environment tag: "PROD" on Hostinger, "DEV" on local machine
+ALERT_ENV = os.getenv("ALERT_ENV", "DEV")
 
 
 def _send_telegram(message: str, retries: int = 1):
     """Send a Telegram message (non-blocking, with retry)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
+    # Prepend environment tag to every message
+    tagged_message = f"[{ALERT_ENV}] {message}"
 
     def _do_send():
         import time as _time
@@ -34,7 +39,7 @@ def _send_telegram(message: str, retries: int = 1):
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 resp = requests.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
+                    "text": tagged_message,
                     "parse_mode": "HTML"
                 }, timeout=10)
                 if resp.status_code == 200:
